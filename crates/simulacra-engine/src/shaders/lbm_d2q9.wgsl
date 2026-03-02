@@ -1,7 +1,10 @@
-// D2Q9 Lattice Boltzmann - BGK collision + streaming
+// D2Q9 Lattice Boltzmann - TRT collision + streaming
+//
+// TRT (Two Relaxation Time) replaces BGK for dramatically better stability
+// at low viscosity. Uses magic parameter Lambda=1/4 → omega_a = 2 - omega_s.
 //
 // Supports: solid bounce-back, inlet (equilibrium BC), outlet (open BC),
-//           gravity via Guo forcing scheme.
+//           gravity via Guo forcing scheme, velocity clamping.
 //
 // Lattice directions:
 //   6  2  5
@@ -117,34 +120,63 @@ fn collide_stream(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // --- Macroscopic quantities ---
     var rho = f[0] + f[1] + f[2] + f[3] + f[4] + f[5] + f[6] + f[7] + f[8];
+    rho = max(rho, 0.001); // prevent division by zero
     var ux = (f[1] + f[5] + f[8] - f[3] - f[6] - f[7]) / rho;
     var uy = (f[2] + f[5] + f[6] - f[4] - f[7] - f[8]) / rho;
 
-    // --- BGK collision with Guo forcing (gravity) ---
+    // --- Guo velocity correction: u_phys = u_lattice + F/(2*rho) ---
     let gx = params.gravity_x;
     let gy = params.gravity_y;
+    ux += gx * 0.5 / rho;
+    uy += gy * 0.5 / rho;
 
-    // Velocity correction for Guo forcing: u = u_lattice + F*dt/(2*rho)
-    // This gives second-order accurate velocity with forcing
-    let ux_corr = ux + gx * 0.5 / rho;
-    let uy_corr = uy + gy * 0.5 / rho;
+    // --- Velocity clamping (LBM requires Ma < ~0.3, cs = 1/sqrt(3)) ---
+    let speed_sq = ux * ux + uy * uy;
+    let max_vel = 0.2;
+    if speed_sq > max_vel * max_vel {
+        let s = max_vel / sqrt(speed_sq);
+        ux *= s;
+        uy *= s;
+    }
+
+    // --- TRT collision with Guo forcing ---
+    // omega_s controls viscosity (user-adjustable)
+    // omega_a chosen via magic parameter Lambda = 1/4 for optimal stability:
+    //   (1/omega_s - 0.5)(1/omega_a - 0.5) = 1/4  →  omega_a = 2 - omega_s
+    let omega_s = params.omega;
+    let omega_a = 2.0 - omega_s;
+
+    // Pre-compute equilibrium
+    var eq: array<f32, 9>;
+    for (var q = 0u; q < 9u; q++) {
+        eq[q] = feq(q, rho, ux, uy);
+    }
 
     var f_post: array<f32, 9>;
     for (var q = 0u; q < 9u; q++) {
-        let eq = feq(q, rho, ux_corr, uy_corr);
+        let oq = OPP[q];
 
-        // Guo forcing term: F_i = (1 - omega/2) * w_i *
-        //   [(e_i - u)/cs^2 + (e_i . u) * e_i / cs^4] . F
-        // With cs^2 = 1/3:
+        // Symmetric (even) and antisymmetric (odd) parts
+        let f_plus  = 0.5 * (f[q] + f[oq]);
+        let f_minus = 0.5 * (f[q] - f[oq]);
+        let eq_plus  = 0.5 * (eq[q] + eq[oq]);
+        let eq_minus = 0.5 * (eq[q] - eq[oq]);
+
+        // TRT: relax symmetric part at omega_s, antisymmetric at omega_a
+        f_post[q] = f[q]
+            - omega_s * (f_plus - eq_plus)
+            - omega_a * (f_minus - eq_minus);
+
+        // Guo forcing term (uses omega_s for viscosity correction)
         let ex = f32(EX[q]);
         let ey = f32(EY[q]);
-        let eu = ex * ux_corr + ey * uy_corr;
-        let Fi = (1.0 - params.omega * 0.5) * W[q] * (
-            (ex - ux_corr + 3.0 * eu * ex) * gx +
-            (ey - uy_corr + 3.0 * eu * ey) * gy
+        let eu = ex * ux + ey * uy;
+        let Fi = (1.0 - omega_s * 0.5) * W[q] * (
+            (ex - ux + 3.0 * eu * ex) * gx +
+            (ey - uy + 3.0 * eu * ey) * gy
         ) * 3.0;
 
-        f_post[q] = f[q] - params.omega * (f[q] - eq) + Fi;
+        f_post[q] += Fi;
     }
 
     // --- Streaming ---
