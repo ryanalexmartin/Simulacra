@@ -1,0 +1,10 @@
+[package]
+name = "simulacra-engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wgpu.workspace = true
+bytemuck.workspace = true
+log.workspace = true
+glam.workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "simulacra-proto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+simulacra-engine.path = "../simulacra-engine"
+wgpu.workspace = true
+winit.workspace = true
+pollster.workspace = true
+bytemuck.workspace = true
+log.workspace = true
+env_logger.workspace = true
