@@ -1,14 +1,24 @@
 use simulacra_engine::gpu::GpuContext;
-use simulacra_engine::lbm::Lbm2D;
+use simulacra_engine::lbm::{Lbm2D, CELL_FLUID, CELL_INLET, CELL_OUTLET, CELL_SOLID};
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 const SIM_WIDTH: u32 = 256;
 const SIM_HEIGHT: u32 = 256;
 const STEPS_PER_FRAME: u32 = 20;
+const BRUSH_RADIUS: i32 = 3;
+const INLET_VELOCITY: f32 = 0.08;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Tool {
+    Solid,
+    Inlet,
+    Outlet,
+}
 
 struct App {
     state: Option<AppState>,
@@ -25,6 +35,18 @@ struct AppState {
     frame_count: u64,
     last_fps_time: std::time::Instant,
     fps_frame_count: u64,
+    // Interaction state
+    cell_types: Vec<u32>,
+    cell_props: Vec<f32>,
+    mouse_pos: (f64, f64),
+    left_pressed: bool,
+    right_pressed: bool,
+    cell_types_dirty: bool,
+    cell_props_dirty: bool,
+    // Controls
+    current_tool: Tool,
+    gravity_on: bool,
+    paused: bool,
 }
 
 impl App {
@@ -43,7 +65,7 @@ impl ApplicationHandler for App {
             event_loop
                 .create_window(
                     Window::default_attributes()
-                        .with_title("Simulacra — LBM Fluid (D2Q9)")
+                        .with_title("Simulacra — LBM Fluid")
                         .with_inner_size(winit::dpi::LogicalSize::new(768, 768)),
                 )
                 .expect("Failed to create window"),
@@ -71,11 +93,62 @@ impl ApplicationHandler for App {
                 if new_size.width > 0 && new_size.height > 0 {
                     state.surface_config.width = new_size.width;
                     state.surface_config.height = new_size.height;
-                    state.surface.configure(&state.gpu.device, &state.surface_config);
+                    state
+                        .surface
+                        .configure(&state.gpu.device, &state.surface_config);
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                state.mouse_pos = (position.x, position.y);
+                if state.left_pressed || state.right_pressed {
+                    let drawing = state.left_pressed;
+                    paint_cells(state, drawing);
+                }
+            }
+            WindowEvent::MouseInput {
+                state: btn_state,
+                button,
+                ..
+            } => match button {
+                MouseButton::Left => {
+                    state.left_pressed = btn_state == ElementState::Pressed;
+                    if state.left_pressed {
+                        paint_cells(state, true);
+                    }
+                }
+                MouseButton::Right => {
+                    state.right_pressed = btn_state == ElementState::Pressed;
+                    if state.right_pressed {
+                        paint_cells(state, false);
+                    }
+                }
+                _ => {}
+            },
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state == ElementState::Pressed {
+                    if let PhysicalKey::Code(key) = event.physical_key {
+                        handle_key(state, key);
+                    }
                 }
             }
             WindowEvent::RedrawRequested => {
-                // Run LBM simulation steps
+                // Upload cell types/props if changed
+                if state.cell_types_dirty {
+                    state
+                        .lbm
+                        .upload_cell_types(&state.gpu.queue, &state.cell_types);
+                    state.cell_types_dirty = false;
+                }
+                if state.cell_props_dirty {
+                    state
+                        .lbm
+                        .upload_cell_props(&state.gpu.queue, &state.cell_props);
+                    state.cell_props_dirty = false;
+                }
+
+                // Upload params every frame (supports runtime changes)
+                state.lbm.update_params(&state.gpu.queue);
+
                 let mut encoder =
                     state
                         .gpu
@@ -84,9 +157,10 @@ impl ApplicationHandler for App {
                             label: Some("frame_encoder"),
                         });
 
-                state.lbm.step(&mut encoder, STEPS_PER_FRAME);
+                if !state.paused {
+                    state.lbm.step(&mut encoder, STEPS_PER_FRAME);
+                }
 
-                // Render to screen
                 let frame = state
                     .surface
                     .get_current_texture()
@@ -113,22 +187,32 @@ impl ApplicationHandler for App {
 
                     rpass.set_pipeline(&state.render_pipeline);
                     rpass.set_bind_group(0, &state.render_bind_group, &[]);
-                    rpass.draw(0..3, 0..1); // fullscreen triangle
+                    rpass.draw(0..3, 0..1);
                 }
 
                 state.gpu.queue.submit(Some(encoder.finish()));
                 frame.present();
 
-                // FPS counter
+                // FPS counter + status
                 state.frame_count += 1;
                 state.fps_frame_count += 1;
                 let elapsed = state.last_fps_time.elapsed();
                 if elapsed.as_secs_f64() >= 1.0 {
                     let fps = state.fps_frame_count as f64 / elapsed.as_secs_f64();
                     let sim_steps_per_sec = fps * STEPS_PER_FRAME as f64;
+                    let nu = (1.0 / state.lbm.params.omega as f64 - 0.5) / 3.0;
+                    let re = INLET_VELOCITY as f64 * SIM_WIDTH as f64 / nu;
+                    let tool_name = match state.current_tool {
+                        Tool::Solid => "solid",
+                        Tool::Inlet => "inlet",
+                        Tool::Outlet => "outlet",
+                    };
+                    let grav = if state.gravity_on { "ON" } else { "OFF" };
+                    let pause = if state.paused { " [PAUSED]" } else { "" };
                     state.window.set_title(&format!(
-                        "Simulacra — LBM {}x{} | {:.0} fps | {:.0} steps/s",
-                        SIM_WIDTH, SIM_HEIGHT, fps, sim_steps_per_sec
+                        "Simulacra — LBM {}x{} | {:.0} fps | {:.0} steps/s | \u{03C9}={:.2} Re~{:.0} | tool:{} grav:{}{} | 1/2/3:tool G:grav \u{2191}\u{2193}:visc R:reset Space:pause",
+                        SIM_WIDTH, SIM_HEIGHT, fps, sim_steps_per_sec,
+                        state.lbm.params.omega, re, tool_name, grav, pause
                     ));
                     state.last_fps_time = std::time::Instant::now();
                     state.fps_frame_count = 0;
@@ -139,6 +223,99 @@ impl ApplicationHandler for App {
             _ => {}
         }
     }
+}
+
+fn handle_key(state: &mut AppState, key: KeyCode) {
+    match key {
+        KeyCode::KeyG => {
+            state.gravity_on = !state.gravity_on;
+            if state.gravity_on {
+                state.lbm.params.gravity_x = 0.0;
+                state.lbm.params.gravity_y = -0.0001;
+            } else {
+                state.lbm.params.gravity_x = 0.0;
+                state.lbm.params.gravity_y = 0.0;
+            }
+        }
+        KeyCode::ArrowUp => {
+            let omega = (state.lbm.params.omega + 0.02).min(1.98);
+            state.lbm.params.omega = omega;
+        }
+        KeyCode::ArrowDown => {
+            let omega = (state.lbm.params.omega - 0.02).max(1.0);
+            state.lbm.params.omega = omega;
+        }
+        KeyCode::Digit1 => {
+            state.current_tool = Tool::Solid;
+        }
+        KeyCode::Digit2 => {
+            state.current_tool = Tool::Inlet;
+        }
+        KeyCode::Digit3 => {
+            state.current_tool = Tool::Outlet;
+        }
+        KeyCode::KeyR => {
+            // Reset simulation
+            let num_cells = (SIM_WIDTH * SIM_HEIGHT) as usize;
+            state.cell_types = vec![CELL_FLUID; num_cells];
+            state.cell_props = vec![0.0f32; num_cells * 2];
+            state.cell_types_dirty = true;
+            state.cell_props_dirty = true;
+            state.lbm.reset(&state.gpu.queue);
+        }
+        KeyCode::Space => {
+            state.paused = !state.paused;
+        }
+        _ => {}
+    }
+}
+
+/// Convert mouse position to simulation grid coordinates and paint a brush.
+fn paint_cells(state: &mut AppState, draw: bool) {
+    let win_size = state.window.inner_size();
+    let sx = state.mouse_pos.0 / win_size.width as f64 * SIM_WIDTH as f64;
+    let sy = state.mouse_pos.1 / win_size.height as f64 * SIM_HEIGHT as f64;
+    let cx = sx as i32;
+    let cy = sy as i32;
+
+    for dy in -BRUSH_RADIUS..=BRUSH_RADIUS {
+        for dx in -BRUSH_RADIUS..=BRUSH_RADIUS {
+            if dx * dx + dy * dy > BRUSH_RADIUS * BRUSH_RADIUS {
+                continue; // circular brush
+            }
+            let px = cx + dx;
+            let py = cy + dy;
+            if px >= 0 && px < SIM_WIDTH as i32 && py >= 0 && py < SIM_HEIGHT as i32 {
+                let idx = py as usize * SIM_WIDTH as usize + px as usize;
+                if draw {
+                    match state.current_tool {
+                        Tool::Solid => {
+                            state.cell_types[idx] = CELL_SOLID;
+                            state.cell_props[idx * 2] = 0.0;
+                            state.cell_props[idx * 2 + 1] = 0.0;
+                        }
+                        Tool::Inlet => {
+                            state.cell_types[idx] = CELL_INLET;
+                            state.cell_props[idx * 2] = INLET_VELOCITY;
+                            state.cell_props[idx * 2 + 1] = 0.0;
+                        }
+                        Tool::Outlet => {
+                            state.cell_types[idx] = CELL_OUTLET;
+                            state.cell_props[idx * 2] = 0.0;
+                            state.cell_props[idx * 2 + 1] = 0.0;
+                        }
+                    }
+                } else {
+                    // Erase: set to fluid
+                    state.cell_types[idx] = CELL_FLUID;
+                    state.cell_props[idx * 2] = 0.0;
+                    state.cell_props[idx * 2 + 1] = 0.0;
+                }
+            }
+        }
+    }
+    state.cell_types_dirty = true;
+    state.cell_props_dirty = true;
 }
 
 async fn init_state(window: Arc<Window>) -> AppState {
@@ -161,10 +338,7 @@ async fn init_state(window: Arc<Window>) -> AppState {
         .expect("Failed to find a suitable GPU adapter");
 
     let adapter_info = adapter.get_info();
-    println!(
-        "GPU: {} ({:?})",
-        adapter_info.name, adapter_info.backend
-    );
+    println!("GPU: {} ({:?})", adapter_info.name, adapter_info.backend);
 
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
@@ -197,7 +371,6 @@ async fn init_state(window: Arc<Window>) -> AppState {
     };
     surface.configure(&device, &surface_config);
 
-    // Build a GpuContext from the device/queue we already created
     let gpu = GpuContext {
         instance,
         device,
@@ -205,10 +378,9 @@ async fn init_state(window: Arc<Window>) -> AppState {
         adapter_info,
     };
 
-    // Create LBM simulation
     let lbm = Lbm2D::new(&gpu, SIM_WIDTH, SIM_HEIGHT);
 
-    // Create render pipeline
+    // Render pipeline setup
     let render_shader = gpu
         .device
         .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -216,7 +388,6 @@ async fn init_state(window: Arc<Window>) -> AppState {
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/render.wgsl").into()),
         });
 
-    // Render params: just width and height (with padding for alignment)
     let render_params: [u32; 4] = [SIM_WIDTH, SIM_HEIGHT, 0, 0];
     let render_params_buffer = gpu.create_buffer_init(
         "render_params",
@@ -306,6 +477,10 @@ async fn init_state(window: Arc<Window>) -> AppState {
                 cache: None,
             });
 
+    let num_cells = (SIM_WIDTH * SIM_HEIGHT) as usize;
+    let cell_types = vec![CELL_FLUID; num_cells];
+    let cell_props = vec![0.0f32; num_cells * 2];
+
     AppState {
         window,
         surface,
@@ -317,6 +492,16 @@ async fn init_state(window: Arc<Window>) -> AppState {
         frame_count: 0,
         last_fps_time: std::time::Instant::now(),
         fps_frame_count: 0,
+        cell_types,
+        cell_props,
+        mouse_pos: (0.0, 0.0),
+        left_pressed: false,
+        right_pressed: false,
+        cell_types_dirty: false,
+        cell_props_dirty: false,
+        current_tool: Tool::Solid,
+        gravity_on: true,
+        paused: false,
     }
 }
 

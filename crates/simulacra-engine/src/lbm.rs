@@ -1,8 +1,8 @@
 //! 2D Lattice Boltzmann Method (D2Q9) on GPU via wgpu compute shaders.
 //!
 //! Implements the BGK (single relaxation time) collision operator with
-//! streaming on a D2Q9 lattice. Boundary conditions: bounce-back on walls,
-//! moving lid on top (lid-driven cavity).
+//! streaming on a D2Q9 lattice. Supports interactive solid obstacles
+//! via a cell_type buffer that can be updated at runtime.
 
 use crate::gpu::GpuContext;
 use bytemuck::{Pod, Zeroable};
@@ -20,53 +20,80 @@ pub const W: [f32; 9] = [
     1.0 / 36.0, // south-east
 ];
 
-/// D2Q9 lattice velocities (ex, ey) for each direction
-pub const EX: [i32; 9] = [0, 1, 0, -1, 0, 1, -1, -1, 1];
-pub const EY: [i32; 9] = [0, 0, 1, 0, -1, 1, 1, -1, -1];
-
-/// Opposite direction indices for bounce-back
-pub const OPP: [u32; 9] = [0, 3, 4, 1, 2, 7, 8, 5, 6];
+/// Cell types
+pub const CELL_FLUID: u32 = 0;
+pub const CELL_SOLID: u32 = 1;
+pub const CELL_INLET: u32 = 2;
+pub const CELL_OUTLET: u32 = 3;
 
 /// Simulation parameters passed to the GPU as a uniform buffer.
+/// Padded to 32 bytes (2x vec4) for uniform buffer alignment.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct LbmParams {
     pub width: u32,
     pub height: u32,
     /// Relaxation parameter: omega = 1/tau. Controls viscosity.
-    /// viscosity = (1/omega - 0.5) / 3.0 in lattice units.
     pub omega: f32,
-    /// Lid velocity (lattice units, typically 0.05-0.1)
-    pub lid_velocity: f32,
+    pub gravity_x: f32,
+    pub gravity_y: f32,
+    pub _pad0: f32,
+    pub _pad1: f32,
+    pub _pad2: f32,
 }
 
 /// The 2D LBM simulation state living on the GPU.
 pub struct Lbm2D {
     pub params: LbmParams,
     params_buffer: wgpu::Buffer,
-    /// Distribution functions: 9 floats per cell, double-buffered.
-    /// Layout: f[direction * width * height + y * width + x]
+    /// Distribution functions: double-buffered. Layout: f[q * W * H + y * W + x]
     f_buffers: [wgpu::Buffer; 2],
-    /// Output buffer: density and velocity for visualization.
-    /// Layout: [rho, ux, uy, curl] per cell (4 floats)
+    /// Cell type per cell: 0=fluid, 1=solid, 2=inlet, 3=outlet. CPU-writable.
+    pub cell_type_buffer: wgpu::Buffer,
+    /// Per-cell properties: [ux, uy] per cell (inlet velocity, etc). CPU-writable.
+    pub cell_props_buffer: wgpu::Buffer,
+    /// Output: [rho, ux, uy, curl] per cell
     pub output_buffer: wgpu::Buffer,
-    /// Which f_buffer is current (0 or 1)
     current: usize,
     collide_stream_pipeline: wgpu::ComputePipeline,
     output_pipeline: wgpu::ComputePipeline,
-    bind_groups: [wgpu::BindGroup; 2], // one per ping-pong direction
+    bind_groups: [wgpu::BindGroup; 2],
     output_bind_groups: [wgpu::BindGroup; 2],
+}
+
+/// Helper to create a bind group layout entry for a storage or uniform buffer.
+fn bgl_entry(binding: u32, ty: wgpu::BufferBindingType) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+fn bg_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+    wgpu::BindGroupEntry {
+        binding,
+        resource: buffer.as_entire_binding(),
+    }
 }
 
 impl Lbm2D {
     pub fn new(gpu: &GpuContext, width: u32, height: u32) -> Self {
-        let omega = 1.4; // tau = 1/1.4 ≈ 0.714, moderate viscosity
-        let lid_velocity = 0.08;
+        let omega = 1.85;
         let params = LbmParams {
             width,
             height,
             omega,
-            lid_velocity,
+            gravity_x: 0.0,
+            gravity_y: -0.0001,
+            _pad0: 0.0,
+            _pad1: 0.0,
+            _pad2: 0.0,
         };
 
         let num_cells = (width * height) as usize;
@@ -74,12 +101,9 @@ impl Lbm2D {
 
         // Initialize distributions to equilibrium at rest (rho=1, u=0)
         let mut f_init = vec![0.0f32; num_cells * 9];
-        for y in 0..height {
-            for x in 0..width {
-                let idx = (y * width + x) as usize;
-                for q in 0..9 {
-                    f_init[q * num_cells + idx] = W[q];
-                }
+        for cell in 0..num_cells {
+            for q in 0..9 {
+                f_init[q * num_cells + cell] = W[q];
             }
         }
 
@@ -87,12 +111,12 @@ impl Lbm2D {
             gpu.create_buffer_init(
                 "f0",
                 &f_init,
-                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             ),
             gpu.create_buffer_init(
                 "f1",
                 &f_init,
-                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             ),
         ];
 
@@ -102,13 +126,28 @@ impl Lbm2D {
             wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         );
 
+        // Cell types: all fluid initially
+        let cell_types = vec![CELL_FLUID; num_cells];
+        let cell_type_buffer = gpu.create_buffer_init(
+            "cell_type",
+            &cell_types,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
+
+        // Per-cell properties: 2 floats (ux, uy) per cell
+        let cell_props = vec![0.0f32; num_cells * 2];
+        let cell_props_buffer = gpu.create_buffer_init(
+            "cell_props",
+            &cell_props,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
+
         let output_buffer = gpu.create_buffer(
             "lbm_output",
             output_size,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         );
 
-        // Shader
         let shader = gpu
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -118,210 +157,124 @@ impl Lbm2D {
                 ),
             });
 
-        // Bind group layout for collide+stream: params (uniform), f_in (read), f_out (write)
+        // Bind group layout: params, f_in, f_out, cell_type
+        let uniform = wgpu::BufferBindingType::Uniform;
+        let ro = wgpu::BufferBindingType::Storage { read_only: true };
+        let rw = wgpu::BufferBindingType::Storage { read_only: false };
+
         let cs_bgl =
             gpu.device
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some("cs_bgl"),
                     entries: &[
-                        // params
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        // f_in (read-only storage)
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        // f_out (read-write storage)
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 2,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
+                        bgl_entry(0, uniform),
+                        bgl_entry(1, ro), // f_in
+                        bgl_entry(2, rw), // f_out
+                        bgl_entry(3, ro), // cell_type
+                        bgl_entry(4, ro), // cell_props
                     ],
                 });
 
-        // Bind group layout for output: params, f_in, output
+        // Output layout: params, f_in, output, cell_type, cell_props
         let out_bgl =
             gpu.device
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some("out_bgl"),
                     entries: &[
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 2,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
+                        bgl_entry(0, uniform),
+                        bgl_entry(1, ro), // f_in
+                        bgl_entry(2, rw), // output
+                        bgl_entry(3, ro), // cell_type
+                        bgl_entry(4, ro), // cell_props
                     ],
                 });
 
-        let cs_pipeline_layout =
-            gpu.device
+        let make_pipeline = |layout: &wgpu::BindGroupLayout, entry: &str, label: &str| {
+            let pl = gpu
+                .device
                 .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("cs_pl"),
-                    bind_group_layouts: &[&cs_bgl],
+                    label: Some(label),
+                    bind_group_layouts: &[layout],
                     push_constant_ranges: &[],
                 });
-
-        let out_pipeline_layout =
-            gpu.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("out_pl"),
-                    bind_group_layouts: &[&out_bgl],
-                    push_constant_ranges: &[],
-                });
-
-        let collide_stream_pipeline =
             gpu.device
                 .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("collide_stream"),
-                    layout: Some(&cs_pipeline_layout),
+                    label: Some(label),
+                    layout: Some(&pl),
                     module: &shader,
-                    entry_point: Some("collide_stream"),
+                    entry_point: Some(entry),
                     compilation_options: Default::default(),
                     cache: None,
-                });
+                })
+        };
 
-        let output_pipeline =
-            gpu.device
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("compute_output"),
-                    layout: Some(&out_pipeline_layout),
-                    module: &shader,
-                    entry_point: Some("compute_output"),
-                    compilation_options: Default::default(),
-                    cache: None,
-                });
+        let collide_stream_pipeline = make_pipeline(&cs_bgl, "collide_stream", "cs_pipeline");
+        let output_pipeline = make_pipeline(&out_bgl, "compute_output", "out_pipeline");
 
-        // Create bind groups for both ping-pong directions
+        let make_bg = |label, layout: &wgpu::BindGroupLayout, entries: &[wgpu::BindGroupEntry]| {
+            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout,
+                entries,
+            })
+        };
+
         let bind_groups = [
-            // 0→1: read from f0, write to f1
-            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("cs_bg_0to1"),
-                layout: &cs_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: params_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: f_buffers[0].as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: f_buffers[1].as_entire_binding(),
-                    },
+            make_bg(
+                "cs_0to1",
+                &cs_bgl,
+                &[
+                    bg_entry(0, &params_buffer),
+                    bg_entry(1, &f_buffers[0]),
+                    bg_entry(2, &f_buffers[1]),
+                    bg_entry(3, &cell_type_buffer),
+                    bg_entry(4, &cell_props_buffer),
                 ],
-            }),
-            // 1→0: read from f1, write to f0
-            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("cs_bg_1to0"),
-                layout: &cs_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: params_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: f_buffers[1].as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: f_buffers[0].as_entire_binding(),
-                    },
+            ),
+            make_bg(
+                "cs_1to0",
+                &cs_bgl,
+                &[
+                    bg_entry(0, &params_buffer),
+                    bg_entry(1, &f_buffers[1]),
+                    bg_entry(2, &f_buffers[0]),
+                    bg_entry(3, &cell_type_buffer),
+                    bg_entry(4, &cell_props_buffer),
                 ],
-            }),
+            ),
         ];
 
         let output_bind_groups = [
-            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("out_bg_0"),
-                layout: &out_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: params_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: f_buffers[0].as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: output_buffer.as_entire_binding(),
-                    },
+            make_bg(
+                "out_0",
+                &out_bgl,
+                &[
+                    bg_entry(0, &params_buffer),
+                    bg_entry(1, &f_buffers[0]),
+                    bg_entry(2, &output_buffer),
+                    bg_entry(3, &cell_type_buffer),
+                    bg_entry(4, &cell_props_buffer),
                 ],
-            }),
-            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("out_bg_1"),
-                layout: &out_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: params_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: f_buffers[1].as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: output_buffer.as_entire_binding(),
-                    },
+            ),
+            make_bg(
+                "out_1",
+                &out_bgl,
+                &[
+                    bg_entry(0, &params_buffer),
+                    bg_entry(1, &f_buffers[1]),
+                    bg_entry(2, &output_buffer),
+                    bg_entry(3, &cell_type_buffer),
+                    bg_entry(4, &cell_props_buffer),
                 ],
-            }),
+            ),
         ];
 
         Self {
             params,
             params_buffer,
             f_buffers,
+            cell_type_buffer,
+            cell_props_buffer,
             output_buffer,
             current: 0,
             collide_stream_pipeline,
@@ -329,6 +282,35 @@ impl Lbm2D {
             bind_groups,
             output_bind_groups,
         }
+    }
+
+    /// Upload cell types from CPU to GPU.
+    pub fn upload_cell_types(&self, queue: &wgpu::Queue, data: &[u32]) {
+        queue.write_buffer(&self.cell_type_buffer, 0, bytemuck::cast_slice(data));
+    }
+
+    /// Upload per-cell properties (2 floats per cell: ux, uy) from CPU to GPU.
+    pub fn upload_cell_props(&self, queue: &wgpu::Queue, data: &[f32]) {
+        queue.write_buffer(&self.cell_props_buffer, 0, bytemuck::cast_slice(data));
+    }
+
+    /// Upload current params to the GPU uniform buffer (call after modifying self.params).
+    pub fn update_params(&self, queue: &wgpu::Queue) {
+        queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&self.params));
+    }
+
+    /// Reset distributions to equilibrium at rest. Call after clearing cell types.
+    pub fn reset(&mut self, queue: &wgpu::Queue) {
+        let num_cells = (self.params.width * self.params.height) as usize;
+        let mut f_init = vec![0.0f32; num_cells * 9];
+        for q in 0..9 {
+            for cell in 0..num_cells {
+                f_init[q * num_cells + cell] = W[q];
+            }
+        }
+        queue.write_buffer(&self.f_buffers[0], 0, bytemuck::cast_slice(&f_init));
+        queue.write_buffer(&self.f_buffers[1], 0, bytemuck::cast_slice(&f_init));
+        self.current = 0;
     }
 
     /// Run N simulation steps, then compute output fields.
@@ -349,7 +331,6 @@ impl Lbm2D {
             self.current = 1 - self.current;
         }
 
-        // Compute macroscopic output from current distributions
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("lbm_output"),
             timestamp_writes: None,

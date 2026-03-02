@@ -69,6 +69,27 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let uy = field[base + 2u];
     let curl = field[base + 3u];
 
+    // Solid cells: rho == -1.0 sentinel
+    if rho > -1.5 && rho < -0.5 {
+        return vec4<f32>(0.15, 0.15, 0.18, 1.0);
+    }
+
+    // Inlet cells: rho == -2.0 sentinel (blue tint)
+    if rho > -2.5 && rho < -1.5 {
+        let speed = sqrt(ux * ux + uy * uy);
+        let base_color = colormap_speed(speed * 15.0);
+        let tinted = mix(base_color, vec3<f32>(0.2, 0.4, 0.9), 0.5);
+        return vec4<f32>(tinted, 1.0);
+    }
+
+    // Outlet cells: rho == -3.0 sentinel (green tint)
+    if rho > -3.5 && rho < -2.5 {
+        let speed = sqrt(ux * ux + uy * uy);
+        let base_color = colormap_speed(speed * 15.0);
+        let tinted = mix(base_color, vec3<f32>(0.2, 0.8, 0.3), 0.5);
+        return vec4<f32>(tinted, 1.0);
+    }
+
     // Velocity magnitude visualization
     let speed = sqrt(ux * ux + uy * uy);
     let color = colormap_speed(speed * 15.0);
