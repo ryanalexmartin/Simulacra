@@ -1,5 +1,6 @@
 use simulacra_engine::gpu::GpuContext;
 use simulacra_engine::lbm::{Lbm2D, CELL_FLUID, CELL_INLET, CELL_OUTLET, CELL_SOLID};
+use simulacra_engine::rigidbody::{BallGpuData, BallRenderParams, BallWorld, MAX_BALLS};
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
@@ -12,12 +13,14 @@ const SIM_HEIGHT: u32 = 256;
 const STEPS_PER_FRAME: u32 = 20;
 const BRUSH_RADIUS: i32 = 3;
 const INLET_VELOCITY: f32 = 0.08;
+const BALL_RADIUS: f32 = 6.0;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tool {
     Solid,
     Inlet,
     Outlet,
+    Ball,
 }
 
 struct App {
@@ -32,10 +35,12 @@ struct AppState {
     lbm: Lbm2D,
     render_pipeline: wgpu::RenderPipeline,
     render_bind_group: wgpu::BindGroup,
+    render_bind_group_1: wgpu::BindGroup,
     frame_count: u64,
     last_fps_time: std::time::Instant,
     fps_frame_count: u64,
     // Interaction state
+    base_cell_types: Vec<u32>,
     cell_types: Vec<u32>,
     cell_props: Vec<f32>,
     mouse_pos: (f64, f64),
@@ -47,6 +52,13 @@ struct AppState {
     current_tool: Tool,
     gravity_on: bool,
     paused: bool,
+    // Rigidbody
+    ball_world: BallWorld,
+    ball_render_buffer: wgpu::Buffer,
+    ball_params_buffer: wgpu::Buffer,
+    // Fluid readback for two-way coupling (1-frame delay)
+    fluid_readback_buffer: wgpu::Buffer,
+    fluid_data: Vec<f32>,
 }
 
 impl App {
@@ -100,7 +112,10 @@ impl ApplicationHandler for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 state.mouse_pos = (position.x, position.y);
-                if state.left_pressed || state.right_pressed {
+                // Don't drag-paint with ball tool
+                if state.current_tool != Tool::Ball
+                    && (state.left_pressed || state.right_pressed)
+                {
                     let drawing = state.left_pressed;
                     paint_cells(state, drawing);
                 }
@@ -109,21 +124,57 @@ impl ApplicationHandler for App {
                 state: btn_state,
                 button,
                 ..
-            } => match button {
-                MouseButton::Left => {
-                    state.left_pressed = btn_state == ElementState::Pressed;
-                    if state.left_pressed {
-                        paint_cells(state, true);
+            } => {
+                if state.current_tool == Tool::Ball {
+                    match button {
+                        MouseButton::Left => {
+                            state.left_pressed = btn_state == ElementState::Pressed;
+                            if state.left_pressed {
+                                // Spawn ball at cursor
+                                let win_size = state.window.inner_size();
+                                let sx = state.mouse_pos.0 / win_size.width as f64
+                                    * SIM_WIDTH as f64;
+                                let sy = state.mouse_pos.1 / win_size.height as f64
+                                    * SIM_HEIGHT as f64;
+                                state
+                                    .ball_world
+                                    .spawn(sx as f32, sy as f32, BALL_RADIUS);
+                            }
+                        }
+                        MouseButton::Right => {
+                            state.right_pressed = btn_state == ElementState::Pressed;
+                            if state.right_pressed {
+                                // Delete nearest ball
+                                let win_size = state.window.inner_size();
+                                let sx = state.mouse_pos.0 / win_size.width as f64
+                                    * SIM_WIDTH as f64;
+                                let sy = state.mouse_pos.1 / win_size.height as f64
+                                    * SIM_HEIGHT as f64;
+                                state
+                                    .ball_world
+                                    .remove_nearest(sx as f32, sy as f32, BALL_RADIUS * 3.0);
+                            }
+                        }
+                        _ => {}
+                    }
+                } else {
+                    match button {
+                        MouseButton::Left => {
+                            state.left_pressed = btn_state == ElementState::Pressed;
+                            if state.left_pressed {
+                                paint_cells(state, true);
+                            }
+                        }
+                        MouseButton::Right => {
+                            state.right_pressed = btn_state == ElementState::Pressed;
+                            if state.right_pressed {
+                                paint_cells(state, false);
+                            }
+                        }
+                        _ => {}
                     }
                 }
-                MouseButton::Right => {
-                    state.right_pressed = btn_state == ElementState::Pressed;
-                    if state.right_pressed {
-                        paint_cells(state, false);
-                    }
-                }
-                _ => {}
-            },
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
                     if let PhysicalKey::Code(key) = event.physical_key {
@@ -132,13 +183,7 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                // Upload cell types/props if changed
-                if state.cell_types_dirty {
-                    state
-                        .lbm
-                        .upload_cell_types(&state.gpu.queue, &state.cell_types);
-                    state.cell_types_dirty = false;
-                }
+                // Upload base cell props if changed by painting
                 if state.cell_props_dirty {
                     state
                         .lbm
@@ -146,9 +191,42 @@ impl ApplicationHandler for App {
                     state.cell_props_dirty = false;
                 }
 
+                if !state.paused {
+                    // Apply fluid forces from LAST frame's readback data
+                    if !state.ball_world.balls.is_empty() {
+                        state.ball_world.apply_fluid_forces(
+                            &state.fluid_data,
+                            SIM_WIDTH,
+                            SIM_HEIGHT,
+                            STEPS_PER_FRAME,
+                        );
+                    }
+
+                    // Step ball physics
+                    state.ball_world.step(
+                        1.0,
+                        SIM_WIDTH,
+                        SIM_HEIGHT,
+                        &state.base_cell_types,
+                        state.gravity_on,
+                    );
+                }
+
+                // 3. Rebuild cell_types with CURRENT ball positions, upload BEFORE LBM step
+                state.cell_types.copy_from_slice(&state.base_cell_types);
+                state.ball_world.rasterize(
+                    &mut state.cell_types,
+                    SIM_WIDTH,
+                    SIM_HEIGHT,
+                );
+                state
+                    .lbm
+                    .upload_cell_types(&state.gpu.queue, &state.cell_types);
+
                 // Upload params every frame (supports runtime changes)
                 state.lbm.update_params(&state.gpu.queue);
 
+                // LBM step — now sees current ball positions as CELL_SOLID
                 let mut encoder =
                     state
                         .gpu
@@ -160,6 +238,9 @@ impl ApplicationHandler for App {
                 if !state.paused {
                     state.lbm.step(&mut encoder, STEPS_PER_FRAME);
                 }
+
+                // Upload ball render data
+                upload_ball_data(state);
 
                 let frame = state
                     .surface
@@ -187,11 +268,42 @@ impl ApplicationHandler for App {
 
                     rpass.set_pipeline(&state.render_pipeline);
                     rpass.set_bind_group(0, &state.render_bind_group, &[]);
+                    rpass.set_bind_group(1, &state.render_bind_group_1, &[]);
                     rpass.draw(0..3, 0..1);
                 }
 
                 state.gpu.queue.submit(Some(encoder.finish()));
                 frame.present();
+
+                // Readback fluid data for ball coupling (uses last frame's output, 1-frame delay)
+                if !state.paused && !state.ball_world.balls.is_empty() {
+                    let output_size = (SIM_WIDTH * SIM_HEIGHT * 4) as u64
+                        * std::mem::size_of::<f32>() as u64;
+                    let mut enc = state
+                        .gpu
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("readback_encoder"),
+                        });
+                    enc.copy_buffer_to_buffer(
+                        &state.lbm.output_buffer,
+                        0,
+                        &state.fluid_readback_buffer,
+                        0,
+                        output_size,
+                    );
+                    state.gpu.queue.submit(Some(enc.finish()));
+
+                    let slice = state.fluid_readback_buffer.slice(..);
+                    slice.map_async(wgpu::MapMode::Read, |_| {});
+                    state.gpu.device.poll(wgpu::PollType::Wait).unwrap();
+                    {
+                        let data = slice.get_mapped_range();
+                        let floats: &[f32] = bytemuck::cast_slice(&data);
+                        state.fluid_data.copy_from_slice(floats);
+                    }
+                    state.fluid_readback_buffer.unmap();
+                }
 
                 // FPS counter + status
                 state.frame_count += 1;
@@ -206,13 +318,15 @@ impl ApplicationHandler for App {
                         Tool::Solid => "solid",
                         Tool::Inlet => "inlet",
                         Tool::Outlet => "outlet",
+                        Tool::Ball => "ball",
                     };
                     let grav = if state.gravity_on { "ON" } else { "OFF" };
                     let pause = if state.paused { " [PAUSED]" } else { "" };
+                    let ball_count = state.ball_world.balls.len();
                     state.window.set_title(&format!(
-                        "Simulacra — LBM {}x{} | {:.0} fps | {:.0} steps/s | \u{03C9}={:.2} Re~{:.0} | tool:{} grav:{}{} | 1/2/3:tool G:grav \u{2191}\u{2193}:visc R:reset Space:pause",
+                        "Simulacra \u{2014} LBM {}x{} | {:.0} fps | {:.0} steps/s | \u{03C9}={:.2} Re~{:.0} | tool:{} balls:{} grav:{}{} | 1/2/3/4:tool G:grav C:clear \u{2191}\u{2193}:visc R:reset Space:pause",
                         SIM_WIDTH, SIM_HEIGHT, fps, sim_steps_per_sec,
-                        state.lbm.params.omega, re, tool_name, grav, pause
+                        state.lbm.params.omega, re, tool_name, ball_count, grav, pause
                     ));
                     state.last_fps_time = std::time::Instant::now();
                     state.fps_frame_count = 0;
@@ -254,13 +368,22 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
         KeyCode::Digit3 => {
             state.current_tool = Tool::Outlet;
         }
+        KeyCode::Digit4 => {
+            state.current_tool = Tool::Ball;
+        }
+        KeyCode::KeyC => {
+            // Clear all balls
+            state.ball_world.balls.clear();
+        }
         KeyCode::KeyR => {
             // Reset simulation
             let num_cells = (SIM_WIDTH * SIM_HEIGHT) as usize;
+            state.base_cell_types = vec![CELL_FLUID; num_cells];
             state.cell_types = vec![CELL_FLUID; num_cells];
             state.cell_props = vec![0.0f32; num_cells * 2];
             state.cell_types_dirty = true;
             state.cell_props_dirty = true;
+            state.ball_world.balls.clear();
             state.lbm.reset(&state.gpu.queue);
         }
         KeyCode::Space => {
@@ -290,24 +413,25 @@ fn paint_cells(state: &mut AppState, draw: bool) {
                 if draw {
                     match state.current_tool {
                         Tool::Solid => {
-                            state.cell_types[idx] = CELL_SOLID;
+                            state.base_cell_types[idx] = CELL_SOLID;
                             state.cell_props[idx * 2] = 0.0;
                             state.cell_props[idx * 2 + 1] = 0.0;
                         }
                         Tool::Inlet => {
-                            state.cell_types[idx] = CELL_INLET;
+                            state.base_cell_types[idx] = CELL_INLET;
                             state.cell_props[idx * 2] = INLET_VELOCITY;
                             state.cell_props[idx * 2 + 1] = 0.0;
                         }
                         Tool::Outlet => {
-                            state.cell_types[idx] = CELL_OUTLET;
+                            state.base_cell_types[idx] = CELL_OUTLET;
                             state.cell_props[idx * 2] = 0.0;
                             state.cell_props[idx * 2 + 1] = 0.0;
                         }
+                        Tool::Ball => {} // handled separately
                     }
                 } else {
                     // Erase: set to fluid
-                    state.cell_types[idx] = CELL_FLUID;
+                    state.base_cell_types[idx] = CELL_FLUID;
                     state.cell_props[idx * 2] = 0.0;
                     state.cell_props[idx * 2 + 1] = 0.0;
                 }
@@ -316,6 +440,28 @@ fn paint_cells(state: &mut AppState, draw: bool) {
     }
     state.cell_types_dirty = true;
     state.cell_props_dirty = true;
+}
+
+/// Upload ball render data to GPU buffers.
+fn upload_ball_data(state: &mut AppState) {
+    let params = BallRenderParams {
+        num_balls: state.ball_world.balls.len() as u32,
+        sim_width: SIM_WIDTH,
+        sim_height: SIM_HEIGHT,
+        _pad: 0,
+    };
+    state
+        .gpu
+        .queue
+        .write_buffer(&state.ball_params_buffer, 0, bytemuck::bytes_of(&params));
+
+    let gpu_data = state.ball_world.gpu_data();
+    if !gpu_data.is_empty() {
+        state
+            .gpu
+            .queue
+            .write_buffer(&state.ball_render_buffer, 0, bytemuck::cast_slice(&gpu_data));
+    }
 }
 
 async fn init_state(window: Arc<Window>) -> AppState {
@@ -395,6 +541,7 @@ async fn init_state(window: Arc<Window>) -> AppState {
         wgpu::BufferUsages::UNIFORM,
     );
 
+    // Group 0: render params + LBM output
     let render_bgl =
         gpu.device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -438,11 +585,74 @@ async fn init_state(window: Arc<Window>) -> AppState {
         ],
     });
 
+    // Group 1: ball params + ball data
+    let ball_params_buffer = gpu.create_buffer_init(
+        "ball_params",
+        &[BallRenderParams {
+            num_balls: 0,
+            sim_width: SIM_WIDTH,
+            sim_height: SIM_HEIGHT,
+            _pad: 0,
+        }],
+        wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    );
+
+    // Pre-allocate for MAX_BALLS
+    let ball_render_data = vec![BallGpuData { x: 0.0, y: 0.0, radius: 0.0, color_id: 0.0 }; MAX_BALLS];
+    let ball_render_buffer = gpu.create_buffer_init(
+        "ball_render_data",
+        &ball_render_data,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    );
+
+    let render_bgl_1 =
+        gpu.device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("render_bgl_1"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+    let render_bind_group_1 = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("render_bg_1"),
+        layout: &render_bgl_1,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: ball_params_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: ball_render_buffer.as_entire_binding(),
+            },
+        ],
+    });
+
     let render_pipeline_layout =
         gpu.device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("render_pl"),
-                bind_group_layouts: &[&render_bgl],
+                bind_group_layouts: &[&render_bgl, &render_bgl_1],
                 push_constant_ranges: &[],
             });
 
@@ -478,8 +688,17 @@ async fn init_state(window: Arc<Window>) -> AppState {
             });
 
     let num_cells = (SIM_WIDTH * SIM_HEIGHT) as usize;
+    let base_cell_types = vec![CELL_FLUID; num_cells];
     let cell_types = vec![CELL_FLUID; num_cells];
     let cell_props = vec![0.0f32; num_cells * 2];
+
+    // Readback buffer for fluid → ball coupling
+    let output_size = (num_cells * 4 * std::mem::size_of::<f32>()) as u64;
+    let fluid_readback_buffer = gpu.create_buffer(
+        "fluid_readback",
+        output_size,
+        wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+    );
 
     AppState {
         window,
@@ -489,9 +708,11 @@ async fn init_state(window: Arc<Window>) -> AppState {
         lbm,
         render_pipeline,
         render_bind_group,
+        render_bind_group_1,
         frame_count: 0,
         last_fps_time: std::time::Instant::now(),
         fps_frame_count: 0,
+        base_cell_types,
         cell_types,
         cell_props,
         mouse_pos: (0.0, 0.0),
@@ -502,6 +723,11 @@ async fn init_state(window: Arc<Window>) -> AppState {
         current_tool: Tool::Solid,
         gravity_on: true,
         paused: false,
+        ball_world: BallWorld::new(),
+        ball_render_buffer,
+        ball_params_buffer,
+        fluid_readback_buffer,
+        fluid_data: vec![0.0f32; num_cells * 4],
     }
 }
 
