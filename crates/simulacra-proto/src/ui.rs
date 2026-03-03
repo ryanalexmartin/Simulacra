@@ -136,9 +136,11 @@ pub fn draw_ui(ctx: &egui::Context, inputs: &UiInputs) -> UiOutputs {
                 outputs.show_level_selector = !outputs.show_level_selector;
             }
 
-            // Reset button
-            if ui.button("Reset [R]").clicked() {
-                outputs.reset_requested = true;
+            // Reset button (hidden on ship levels since R is disabled)
+            if !inputs.ship_active {
+                if ui.button("Reset [R]").clicked() {
+                    outputs.reset_requested = true;
+                }
             }
         });
     });

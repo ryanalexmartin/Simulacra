@@ -6,16 +6,15 @@ pub const MAX_BULLETS: usize = 16;
 // Ship constants
 pub const SHIP_HALF_LEN: f32 = 12.0;
 pub const SHIP_HALF_WIDTH: f32 = 7.0;
-pub const SHIP_MASS: f32 = 8.0;
-pub const THRUST_FORCE: f32 = 0.08;
-pub const ROTATION_SPEED: f32 = 0.07;
+pub const SHIP_MASS: f32 = 1.0;
+pub const THRUST_FORCE: f32 = 0.25;
 pub const SHIP_DRAG: f32 = 0.995;
-pub const THRUSTER_VELOCITY: f32 = 0.20;
+pub const THRUSTER_VELOCITY: f32 = 0.55;
 
 // Bullet constants
-pub const BULLET_SPEED: f32 = 3.0;
-pub const BULLET_RADIUS: f32 = 1.5;
-pub const BULLET_LIFETIME: u32 = 120;
+pub const BULLET_SPEED: f32 = 4.5;
+pub const BULLET_RADIUS: f32 = 2.5;
+pub const BULLET_LIFETIME: u32 = 240;
 pub const FIRE_COOLDOWN: u32 = 8;
 
 // --- GPU data types ---
@@ -77,61 +76,77 @@ impl Ship {
     pub fn step(
         &mut self,
         sub_dt: f32,
-        thrusting: bool,
-        rot_left: bool,
-        rot_right: bool,
+        forward: bool,
+        backward: bool,
+        strafe_left: bool,
+        strafe_right: bool,
+        target_angle: f32,
         width: u32,
         height: u32,
         base_cell_types: &[u32],
+        skip_edge_clamp: bool,
     ) {
         if !self.alive {
             return;
         }
 
-        // Rotate
-        if rot_left {
-            self.angle -= ROTATION_SPEED * sub_dt;
+        // Instant cursor aim
+        self.angle = target_angle;
+
+        // Movement directions
+        let cos_a = self.angle.cos();
+        let sin_a = self.angle.sin();
+        let fwd = [cos_a, sin_a];
+        let left = [-sin_a, cos_a];
+
+        self.thrusting = forward;
+        if forward {
+            self.vel[0] += fwd[0] * THRUST_FORCE * sub_dt / SHIP_MASS;
+            self.vel[1] += fwd[1] * THRUST_FORCE * sub_dt / SHIP_MASS;
         }
-        if rot_right {
-            self.angle += ROTATION_SPEED * sub_dt;
+        if backward {
+            self.vel[0] -= fwd[0] * THRUST_FORCE * 0.6 * sub_dt / SHIP_MASS;
+            self.vel[1] -= fwd[1] * THRUST_FORCE * 0.6 * sub_dt / SHIP_MASS;
+        }
+        if strafe_left {
+            self.vel[0] += left[0] * THRUST_FORCE * 0.7 * sub_dt / SHIP_MASS;
+            self.vel[1] += left[1] * THRUST_FORCE * 0.7 * sub_dt / SHIP_MASS;
+        }
+        if strafe_right {
+            self.vel[0] -= left[0] * THRUST_FORCE * 0.7 * sub_dt / SHIP_MASS;
+            self.vel[1] -= left[1] * THRUST_FORCE * 0.7 * sub_dt / SHIP_MASS;
         }
 
-        // Thrust
-        self.thrusting = thrusting;
-        if thrusting {
-            let fx = self.angle.cos() * THRUST_FORCE * sub_dt;
-            let fy = self.angle.sin() * THRUST_FORCE * sub_dt;
-            self.vel[0] += fx / SHIP_MASS;
-            self.vel[1] += fy / SHIP_MASS;
-        }
-
-        // Drag
-        self.vel[0] *= SHIP_DRAG;
-        self.vel[1] *= SHIP_DRAG;
+        // Drag (timestep-independent: same total drag per frame regardless of sim speed)
+        let drag = SHIP_DRAG.powf(sub_dt);
+        self.vel[0] *= drag;
+        self.vel[1] *= drag;
 
         // Integrate position
         self.pos[0] += self.vel[0] * sub_dt;
         self.pos[1] += self.vel[1] * sub_dt;
 
-        // Clamp to bounds
-        let margin = SHIP_HALF_LEN + 2.0;
-        let w = width as f32;
-        let h = height as f32;
-        if self.pos[0] < margin {
-            self.pos[0] = margin;
-            self.vel[0] = self.vel[0].abs() * 0.5;
-        }
-        if self.pos[0] > w - margin {
-            self.pos[0] = w - margin;
-            self.vel[0] = -self.vel[0].abs() * 0.5;
-        }
-        if self.pos[1] < margin {
-            self.pos[1] = margin;
-            self.vel[1] = self.vel[1].abs() * 0.5;
-        }
-        if self.pos[1] > h - margin {
-            self.pos[1] = h - margin;
-            self.vel[1] = -self.vel[1].abs() * 0.5;
+        // Clamp to bounds (disabled in zone mode so ship can exit through openings)
+        if !skip_edge_clamp {
+            let margin = SHIP_HALF_LEN + 2.0;
+            let w = width as f32;
+            let h = height as f32;
+            if self.pos[0] < margin {
+                self.pos[0] = margin;
+                self.vel[0] = self.vel[0].abs() * 0.5;
+            }
+            if self.pos[0] > w - margin {
+                self.pos[0] = w - margin;
+                self.vel[0] = -self.vel[0].abs() * 0.5;
+            }
+            if self.pos[1] < margin {
+                self.pos[1] = margin;
+                self.vel[1] = self.vel[1].abs() * 0.5;
+            }
+            if self.pos[1] > h - margin {
+                self.pos[1] = h - margin;
+                self.vel[1] = -self.vel[1].abs() * 0.5;
+            }
         }
 
         // Ship-solid collision: sample cells around hull and push away
@@ -259,7 +274,7 @@ impl Ship {
 
         let w = width as f32;
         let h = height as f32;
-        let drag_coeff = 0.010;
+        let drag_coeff = 0.003;
         let spf = steps_per_frame as f32;
 
         let sample_r = SHIP_HALF_LEN + 3.0;
@@ -453,9 +468,9 @@ impl ExplosionWave {
     pub fn new(pos: [f32; 2]) -> Self {
         Self {
             pos,
-            radius: 8.0,
-            strength: 0.15,
-            remaining_steps: 3,
+            radius: 16.0,
+            strength: 0.30,
+            remaining_steps: 5,
         }
     }
 

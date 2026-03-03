@@ -1,6 +1,7 @@
 mod levels;
 mod ship;
 mod ui;
+mod zone;
 
 use levels::{all_levels, load_level, GoalZone, Level};
 use ship::{
@@ -22,7 +23,7 @@ use winit::window::{Fullscreen, Window, WindowId};
 
 const SIM_WIDTH: u32 = 1024;
 const SIM_HEIGHT: u32 = 576;
-const DEFAULT_STEPS_PER_FRAME: u32 = 20;
+const DEFAULT_STEPS_PER_FRAME: u32 = 5;
 const BRUSH_RADIUS: i32 = 3;
 const INLET_VELOCITY: f32 = 0.25;
 const BALL_RADIUS: f32 = 6.0;
@@ -38,6 +39,97 @@ const EMITTER_COLORS: [[f32; 3]; 6] = [
     [0.70, 0.30, 0.85], // purple
     [0.95, 0.55, 0.15], // orange
 ];
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct RenderParams {
+    width: u32,
+    height: u32,
+    _pad0: u32,
+    _pad1: u32,
+    cam_offset_x: f32,
+    cam_offset_y: f32,
+    cam_view_w: f32,
+    cam_view_h: f32,
+    world_offset_x: f32,
+    world_offset_y: f32,
+    _pad2: f32,
+    _pad3: f32,
+}
+
+struct Camera {
+    center: [f32; 2],
+    zoom: f32,
+    sim_width: f32,
+    sim_height: f32,
+    screen_aspect: f32, // screen_width / screen_height
+}
+
+impl Camera {
+    fn new() -> Self {
+        Self {
+            center: [SIM_WIDTH as f32 / 2.0, SIM_HEIGHT as f32 / 2.0],
+            zoom: 1.0,
+            sim_width: SIM_WIDTH as f32,
+            sim_height: SIM_HEIGHT as f32,
+            screen_aspect: SIM_WIDTH as f32 / SIM_HEIGHT as f32,
+        }
+    }
+
+    fn view_width(&self) -> f32 {
+        self.view_height() * self.screen_aspect
+    }
+
+    fn view_height(&self) -> f32 {
+        self.sim_height / self.zoom
+    }
+
+    fn screen_to_sim(&self, mouse_x: f64, mouse_y: f64, win_w: f64, win_h: f64) -> (f32, f32) {
+        let vw = self.view_width();
+        let vh = self.view_height();
+        let offset_x = self.center[0] - vw / 2.0;
+        let offset_y = self.center[1] - vh / 2.0;
+        let sx = offset_x + (mouse_x / win_w) as f32 * vw;
+        let sy = offset_y + (mouse_y / win_h) as f32 * vh;
+        (sx, sy)
+    }
+
+    fn render_params(&self) -> RenderParams {
+        let vw = self.view_width();
+        let vh = self.view_height();
+        RenderParams {
+            width: self.sim_width as u32,
+            height: self.sim_height as u32,
+            _pad0: 0,
+            _pad1: 0,
+            cam_offset_x: self.center[0] - vw / 2.0,
+            cam_offset_y: self.center[1] - vh / 2.0,
+            cam_view_w: vw,
+            cam_view_h: vh,
+            world_offset_x: 0.0,
+            world_offset_y: 0.0,
+            _pad2: 0.0,
+            _pad3: 0.0,
+        }
+    }
+
+    fn clamp_to_bounds(&mut self) {
+        let vw = self.view_width();
+        let vh = self.view_height();
+        let w = self.sim_width;
+        let h = self.sim_height;
+        if vw < w {
+            self.center[0] = self.center[0].clamp(vw / 2.0, w - vw / 2.0);
+        } else {
+            self.center[0] = w / 2.0;
+        }
+        if vh < h {
+            self.center[1] = self.center[1].clamp(vh / 2.0, h - vh / 2.0);
+        } else {
+            self.center[1] = h / 2.0;
+        }
+    }
+}
 
 #[derive(Clone)]
 struct Emitter {
@@ -70,6 +162,11 @@ struct AppState {
     render_bind_group: wgpu::BindGroup,
     render_bind_group_1: wgpu::BindGroup,
     render_dye_bind_groups: [wgpu::BindGroup; 2],
+    render_params_buffer: wgpu::Buffer,
+    render_bgl_0: wgpu::BindGroupLayout,
+    render_bgl_2: wgpu::BindGroupLayout,
+    camera: Camera,
+    zone_manager: Option<zone::ZoneManager>,
     dye_field: DyeField,
     frame_count: u64,
     last_fps_time: std::time::Instant,
@@ -145,7 +242,9 @@ impl ApplicationHandler for App {
                 .expect("Failed to create window"),
         );
 
-        let state = pollster::block_on(init_state(window));
+        let mut state = pollster::block_on(init_state(window));
+        // Auto-load Open Arena (index 5) as the default level
+        apply_level(&mut state, 5);
         self.state = Some(state);
     }
 
@@ -174,6 +273,7 @@ impl ApplicationHandler for App {
                     state
                         .surface
                         .configure(&state.gpu.device, &state.surface_config);
+                    state.camera.screen_aspect = new_size.width as f32 / new_size.height as f32;
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -197,8 +297,10 @@ impl ApplicationHandler for App {
                     return;
                 }
                 let win_size = state.window.inner_size();
-                let sx = (state.mouse_pos.0 / win_size.width as f64 * SIM_WIDTH as f64) as f32;
-                let sy = (state.mouse_pos.1 / win_size.height as f64 * SIM_HEIGHT as f64) as f32;
+                let (sx, sy) = state.camera.screen_to_sim(
+                    state.mouse_pos.0, state.mouse_pos.1,
+                    win_size.width as f64, win_size.height as f64,
+                );
 
                 match state.current_tool {
                     Tool::Ball => match button {
@@ -283,12 +385,20 @@ impl ApplicationHandler for App {
                 if egui_consumed {
                     return;
                 }
-                // Scroll wheel rotates emitter angle (15 degree steps)
-                if state.current_tool == Tool::Inlet || state.current_tool == Tool::Outlet {
-                    let scroll_y = match delta {
-                        winit::event::MouseScrollDelta::LineDelta(_, y) => y as f64,
-                        winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y / 30.0,
-                    };
+                let scroll_y = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y as f64,
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y / 30.0,
+                };
+                if state.ship.is_some() {
+                    // Scroll wheel zooms camera on ship levels
+                    if scroll_y > 0.0 {
+                        state.camera.zoom = (state.camera.zoom * 1.1).min(3.0);
+                    } else if scroll_y < 0.0 {
+                        state.camera.zoom = (state.camera.zoom / 1.1).max(0.25);
+                    }
+                    state.camera.clamp_to_bounds();
+                } else if state.current_tool == Tool::Inlet || state.current_tool == Tool::Outlet {
+                    // Scroll wheel rotates emitter angle (15 degree steps)
                     if scroll_y > 0.0 {
                         state.emitter_angle += std::f32::consts::PI / 12.0;
                     } else if scroll_y < 0.0 {
@@ -320,7 +430,238 @@ impl ApplicationHandler for App {
                 // where the ball jumps many cells between LBM steps.
                 let mut explosions: Vec<BallExplosion> = Vec::new();
 
-                if !state.paused {
+                if !state.paused && state.zone_manager.is_some() {
+                    // --- Multi-zone physics with ship ---
+                    let sim_speed = state.sim_speed;
+
+                    // Get active region info (will be updated if ship transitions)
+                    let (mut active_is_zone, mut active_id, mut ar_w, mut ar_h) = {
+                        let zm = state.zone_manager.as_ref().unwrap();
+                        match zm.active {
+                            zone::ActiveRegion::Zone(id) => (true, id, zm.zones[id].region.width, zm.zones[id].region.height),
+                            zone::ActiveRegion::Tunnel(id) => (false, id, zm.tunnels[id].region.width, zm.tunnels[id].region.height),
+                        }
+                    };
+
+                    // Apply fluid forces from last frame's readback
+                    {
+                        let zm = state.zone_manager.as_ref().unwrap();
+                        let fluid_data = &zm.active_region().fluid_data;
+                        if let Some(ref mut ship) = state.ship {
+                            ship.apply_fluid_forces(fluid_data, ar_w, ar_h, sim_speed);
+                        }
+                    }
+
+                    // Fire cooldown + firing
+                    if let Some(ref mut ship) = state.ship {
+                        if ship.fire_cooldown > 0 { ship.fire_cooldown -= 1; }
+                    }
+                    if state.keys_held.contains(&KeyCode::Space) {
+                        if let Some(ref mut ship) = state.ship {
+                            if ship.alive && ship.fire_cooldown == 0 && state.bullets.len() < MAX_BULLETS {
+                                state.bullets.push(Bullet::spawn(ship));
+                                ship.fire_cooldown = FIRE_COOLDOWN;
+                            }
+                        }
+                    }
+
+                    // Ship inputs
+                    let ship_fwd = state.keys_held.contains(&KeyCode::KeyW);
+                    let ship_back = state.keys_held.contains(&KeyCode::KeyS);
+                    let ship_strafe_l = state.keys_held.contains(&KeyCode::KeyA);
+                    let ship_strafe_r = state.keys_held.contains(&KeyCode::KeyD);
+                    let ship_target_angle = if let Some(ref ship) = state.ship {
+                        let win_size = state.window.inner_size();
+                        let (mx_world, my_world) = state.camera.screen_to_sim(
+                            state.mouse_pos.0, state.mouse_pos.1,
+                            win_size.width as f64, win_size.height as f64,
+                        );
+                        // screen_to_sim returns world coords; convert to local for ship aim
+                        let offset = state.zone_manager.as_ref().unwrap().active_region().world_offset;
+                        let mx_local = mx_world - offset[0];
+                        let my_local = my_world - offset[1];
+                        (my_local - ship.pos[1]).atan2(mx_local - ship.pos[0])
+                    } else { 0.0 };
+
+                    // Sub-step ship + bullets (shared borrow on zone_manager for collision)
+                    let sub_dt = 1.0 / sim_speed as f32;
+                    let mut bullet_impact_dye: Vec<DyeInjectPoint> = Vec::new();
+                    for _ in 0..sim_speed {
+                        {
+                            let zm = state.zone_manager.as_ref().unwrap();
+                            let base_types = if active_is_zone {
+                                &zm.zones[active_id].region.base_cell_types
+                            } else {
+                                &zm.tunnels[active_id].region.base_cell_types
+                            };
+                            if let Some(ref mut ship) = state.ship {
+                                ship.step(sub_dt, ship_fwd, ship_back, ship_strafe_l, ship_strafe_r,
+                                    ship_target_angle, ar_w, ar_h, base_types, true);
+                            }
+                            for bullet in &mut state.bullets {
+                                let hit = bullet.step(sub_dt, ar_w, ar_h, base_types);
+                                if hit {
+                                    state.explosion_waves.push(ExplosionWave::new(bullet.pos));
+                                    bullet_impact_dye.push(DyeInjectPoint {
+                                        x: bullet.pos[0], y: bullet.pos[1],
+                                        r: 1.0, g: 1.0, b: 0.8,
+                                        radius: 12.0, strength: 5.0, _pad: 0.0,
+                                    });
+                                }
+                            }
+                        }
+                        state.bullets.retain(|b| b.alive);
+                    }
+
+                    // Bullet lifetime
+                    for bullet in &mut state.bullets {
+                        bullet.age += 1;
+                        if bullet.age >= ship::BULLET_LIFETIME { bullet.alive = false; }
+                    }
+                    state.bullets.retain(|b| b.alive);
+
+                    // Check zone transition
+                    if let Some(ref ship) = state.ship {
+                        let transition = {
+                            let zm = state.zone_manager.as_ref().unwrap();
+                            zm.check_ship_transition(ship.pos)
+                        };
+                        if let Some(info) = transition {
+                            let zm = state.zone_manager.as_mut().unwrap();
+                            zm.active = info.new_active;
+                            state.ship.as_mut().unwrap().pos = info.new_pos;
+                            // Don't snap camera — the lerp follow handles smooth tracking
+                            // Clear bullets & explosions (don't transfer between regions)
+                            state.bullets.clear();
+                            state.explosion_waves.clear();
+                            bullet_impact_dye.clear();
+                            // Re-fetch active region info for rasterization + LBM
+                            match zm.active {
+                                zone::ActiveRegion::Zone(id) => {
+                                    active_is_zone = true;
+                                    active_id = id;
+                                    ar_w = zm.zones[id].region.width;
+                                    ar_h = zm.zones[id].region.height;
+                                }
+                                zone::ActiveRegion::Tunnel(id) => {
+                                    active_is_zone = false;
+                                    active_id = id;
+                                    ar_w = zm.tunnels[id].region.width;
+                                    ar_h = zm.tunnels[id].region.height;
+                                }
+                            }
+                        }
+                    }
+
+                    // Coupling + rasterize + LBM step (mutable borrow on zone_manager)
+                    {
+                        let gpu = &state.gpu;
+                        let zm = state.zone_manager.as_mut().unwrap();
+
+                        zm.coupling_step();
+                        let (zs, ts) = zm.schedule_steps(sim_speed);
+
+                        // Rasterize ship/bullets/explosions into active region
+                        {
+                            let region = if active_is_zone {
+                                &mut zm.zones[active_id].region
+                            } else {
+                                &mut zm.tunnels[active_id].region
+                            };
+                            if let Some(ref ship) = state.ship {
+                                ship.rasterize(&mut region.cell_types, ar_w, ar_h);
+                                ship.rasterize_thruster(
+                                    &mut region.cell_types, &mut region.cell_props, ar_w, ar_h,
+                                );
+                            }
+                            for bullet in &state.bullets {
+                                bullet.rasterize(&mut region.cell_types, ar_w, ar_h);
+                            }
+                            for wave in &mut state.explosion_waves {
+                                wave.rasterize(
+                                    &mut region.cell_types, &mut region.cell_props, ar_w, ar_h,
+                                );
+                                wave.remaining_steps = wave.remaining_steps.saturating_sub(1);
+                            }
+                        }
+                        state.explosion_waves.retain(|w| w.remaining_steps > 0);
+
+                        // Step all zones + tunnels
+                        let mut enc = gpu.device.create_command_encoder(
+                            &wgpu::CommandEncoderDescriptor { label: Some("zone_step") },
+                        );
+                        zm.step_all(&mut enc, &gpu.queue, &zs, &ts);
+                        zm.compute_outputs(&mut enc, &zs, &ts);
+
+                        // Dye injection
+                        {
+                            // Ship trail dye (injected into whichever region is active)
+                            let mut ship_dye_points: Vec<DyeInjectPoint> = Vec::new();
+                            if let Some(ref ship) = state.ship {
+                                if ship.alive {
+                                    let tp = ship.thruster_pos();
+                                    if ship.thrusting {
+                                        ship_dye_points.push(DyeInjectPoint {
+                                            x: tp[0], y: tp[1],
+                                            r: 1.0, g: 0.7, b: 0.2,
+                                            radius: 5.0, strength: 1.5, _pad: 0.0,
+                                        });
+                                    } else {
+                                        ship_dye_points.push(DyeInjectPoint {
+                                            x: ship.pos[0], y: ship.pos[1],
+                                            r: 0.4, g: 0.5, b: 0.8,
+                                            radius: 3.0, strength: 0.15, _pad: 0.0,
+                                        });
+                                    }
+                                }
+                            }
+                            ship_dye_points.extend(bullet_impact_dye);
+
+                            // Zone 0 always gets inlet dye (it always runs)
+                            let zone_0_inlet_dye: Vec<DyeInjectPoint> = (0..8).map(|i| {
+                                let y = 50.0 + i as f32 * 65.0;
+                                DyeInjectPoint {
+                                    x: 5.0, y,
+                                    r: 0.2, g: 0.5, b: 0.9,
+                                    radius: 25.0, strength: 0.6, _pad: 0.0,
+                                }
+                            }).collect();
+
+                            // Upload dye for all regions
+                            for i in 0..zm.zones.len() {
+                                if zs[i] > 0 {
+                                    zm.zones[i].region.dye.params.vel_scale = sim_speed as f32;
+                                    let mut dye_points: Vec<DyeInjectPoint> = Vec::new();
+                                    if i == 0 { dye_points.extend_from_slice(&zone_0_inlet_dye); }
+                                    if active_is_zone && i == active_id {
+                                        dye_points.extend_from_slice(&ship_dye_points);
+                                    }
+                                    zm.zones[i].region.dye.upload_injections(&gpu.queue, &dye_points);
+                                }
+                            }
+                            for i in 0..zm.tunnels.len() {
+                                if ts[i] > 0 {
+                                    zm.tunnels[i].region.dye.params.vel_scale = sim_speed as f32;
+                                    if !active_is_zone && i == active_id {
+                                        zm.tunnels[i].region.dye.upload_injections(&gpu.queue, &ship_dye_points);
+                                    } else {
+                                        zm.tunnels[i].region.dye.upload_injections(&gpu.queue, &[]);
+                                    }
+                                }
+                            }
+                        }
+                        for (i, zone) in zm.zones.iter_mut().enumerate() {
+                            if zs[i] > 0 { zone.region.dye.step(&mut enc); }
+                        }
+                        for (i, tunnel) in zm.tunnels.iter_mut().enumerate() {
+                            if ts[i] > 0 { tunnel.region.dye.step(&mut enc); }
+                        }
+
+                        gpu.queue.submit([enc.finish()]);
+                        zm.readback_fluid_data(&gpu.device, &gpu.queue, &zs, &ts);
+                    }
+                } else if !state.paused {
+                    // --- Single-grid physics ---
                     // Apply fluid forces from LAST frame's readback (once per frame)
                     if !state.ball_world.balls.is_empty() {
                         state.ball_world.apply_fluid_forces(
@@ -373,10 +714,10 @@ impl ApplicationHandler for App {
                     );
                     if state.current_tool == Tool::Inlet || state.current_tool == Tool::Outlet {
                         let win_size = state.window.inner_size();
-                        let sx = (state.mouse_pos.0 / win_size.width as f64
-                            * SIM_WIDTH as f64) as f32;
-                        let sy = (state.mouse_pos.1 / win_size.height as f64
-                            * SIM_HEIGHT as f64) as f32;
+                        let (sx, sy) = state.camera.screen_to_sim(
+                            state.mouse_pos.0, state.mouse_pos.1,
+                            win_size.width as f64, win_size.height as f64,
+                        );
                         let preview = Emitter {
                             pos: [sx, sy],
                             angle: state.emitter_angle,
@@ -408,10 +749,23 @@ impl ApplicationHandler for App {
                             .upload_cell_props(&state.gpu.queue, &emitter_cell_props);
                     }
 
-                    // Read ship inputs from held keys
-                    let ship_thrust = state.keys_held.contains(&KeyCode::KeyW);
-                    let ship_left = state.keys_held.contains(&KeyCode::KeyA);
-                    let ship_right = state.keys_held.contains(&KeyCode::KeyD);
+                    // Read ship inputs from held keys (WASD movement)
+                    let ship_fwd = state.keys_held.contains(&KeyCode::KeyW);
+                    let ship_back = state.keys_held.contains(&KeyCode::KeyS);
+                    let ship_strafe_l = state.keys_held.contains(&KeyCode::KeyA);
+                    let ship_strafe_r = state.keys_held.contains(&KeyCode::KeyD);
+
+                    // Compute target angle from mouse → sim coords (cursor aim)
+                    let ship_target_angle = if let Some(ref ship) = state.ship {
+                        let win_size = state.window.inner_size();
+                        let (mx, my) = state.camera.screen_to_sim(
+                            state.mouse_pos.0, state.mouse_pos.1,
+                            win_size.width as f64, win_size.height as f64,
+                        );
+                        (my - ship.pos[1]).atan2(mx - ship.pos[0])
+                    } else {
+                        0.0
+                    };
 
                     // Collect bullet impact dye points during sub-steps
                     let mut bullet_impact_dye: Vec<DyeInjectPoint> = Vec::new();
@@ -423,12 +777,15 @@ impl ApplicationHandler for App {
                         if let Some(ref mut ship) = state.ship {
                             ship.step(
                                 sub_dt,
-                                ship_thrust,
-                                ship_left,
-                                ship_right,
+                                ship_fwd,
+                                ship_back,
+                                ship_strafe_l,
+                                ship_strafe_r,
+                                ship_target_angle,
                                 SIM_WIDTH,
                                 SIM_HEIGHT,
                                 &state.base_cell_types,
+                                false,
                             );
                         }
 
@@ -450,8 +807,8 @@ impl ApplicationHandler for App {
                                     r: 1.0,
                                     g: 1.0,
                                     b: 0.8,
-                                    radius: 6.0,
-                                    strength: 3.0,
+                                    radius: 12.0,
+                                    strength: 5.0,
                                     _pad: 0.0,
                                 });
                             }
@@ -580,20 +937,35 @@ impl ApplicationHandler for App {
                             _pad: 0.0,
                         });
                     }
-                    // Ship exhaust dye
+                    // Ship dye: always emit a trail, brighter when thrusting
                     if let Some(ref ship) = state.ship {
-                        if ship.alive && ship.thrusting {
+                        if ship.alive {
                             let tp = ship.thruster_pos();
-                            dye_points.push(DyeInjectPoint {
-                                x: tp[0],
-                                y: tp[1],
-                                r: 1.0,
-                                g: 0.7,
-                                b: 0.2,
-                                radius: 4.0,
-                                strength: 1.0,
-                                _pad: 0.0,
-                            });
+                            if ship.thrusting {
+                                // Bright exhaust plume
+                                dye_points.push(DyeInjectPoint {
+                                    x: tp[0],
+                                    y: tp[1],
+                                    r: 1.0,
+                                    g: 0.7,
+                                    b: 0.2,
+                                    radius: 5.0,
+                                    strength: 1.5,
+                                    _pad: 0.0,
+                                });
+                            } else {
+                                // Subtle contrail from ship body
+                                dye_points.push(DyeInjectPoint {
+                                    x: ship.pos[0],
+                                    y: ship.pos[1],
+                                    r: 0.4,
+                                    g: 0.5,
+                                    b: 0.8,
+                                    radius: 3.0,
+                                    strength: 0.15,
+                                    _pad: 0.0,
+                                });
+                            }
                         }
                     }
                     // Bullet impact dye
@@ -627,10 +999,10 @@ impl ApplicationHandler for App {
                     );
                     if state.current_tool == Tool::Inlet || state.current_tool == Tool::Outlet {
                         let win_size = state.window.inner_size();
-                        let sx = (state.mouse_pos.0 / win_size.width as f64
-                            * SIM_WIDTH as f64) as f32;
-                        let sy = (state.mouse_pos.1 / win_size.height as f64
-                            * SIM_HEIGHT as f64) as f32;
+                        let (sx, sy) = state.camera.screen_to_sim(
+                            state.mouse_pos.0, state.mouse_pos.1,
+                            win_size.width as f64, win_size.height as f64,
+                        );
                         let preview = Emitter {
                             pos: [sx, sy],
                             angle: state.emitter_angle,
@@ -667,6 +1039,69 @@ impl ApplicationHandler for App {
                     check_goals(state);
                 }
 
+                // Camera follow: lerp toward ship when alive
+                if let Some(ref ship) = state.ship {
+                    if ship.alive {
+                        let lerp = 0.08;
+                        // In zone mode, convert ship local pos to world pos
+                        let (target_x, target_y) = if let Some(ref zm) = state.zone_manager {
+                            let offset = zm.active_region().world_offset;
+                            (ship.pos[0] + offset[0], ship.pos[1] + offset[1])
+                        } else {
+                            (ship.pos[0], ship.pos[1])
+                        };
+                        state.camera.center[0] += (target_x - state.camera.center[0]) * lerp;
+                        state.camera.center[1] += (target_y - state.camera.center[1]) * lerp;
+                        state.camera.clamp_to_bounds();
+                    }
+                }
+
+                // Upload camera render params
+                if let Some(ref zm) = state.zone_manager {
+                    // Zone mode: write per-region render params with world offsets
+                    let vw = state.camera.view_width();
+                    let vh = state.camera.view_height();
+                    let cam_ox = state.camera.center[0] - vw / 2.0;
+                    let cam_oy = state.camera.center[1] - vh / 2.0;
+                    for zone in &zm.zones {
+                        let rp = RenderParams {
+                            width: zone.region.width,
+                            height: zone.region.height,
+                            _pad0: 0, _pad1: 0,
+                            cam_offset_x: cam_ox,
+                            cam_offset_y: cam_oy,
+                            cam_view_w: vw,
+                            cam_view_h: vh,
+                            world_offset_x: zone.region.world_offset[0],
+                            world_offset_y: zone.region.world_offset[1],
+                            _pad2: 0.0, _pad3: 0.0,
+                        };
+                        state.gpu.queue.write_buffer(&zone.region.render_params_buffer, 0, bytemuck::bytes_of(&rp));
+                    }
+                    for tunnel in &zm.tunnels {
+                        let rp = RenderParams {
+                            width: tunnel.region.width,
+                            height: tunnel.region.height,
+                            _pad0: 0, _pad1: 0,
+                            cam_offset_x: cam_ox,
+                            cam_offset_y: cam_oy,
+                            cam_view_w: vw,
+                            cam_view_h: vh,
+                            world_offset_x: tunnel.region.world_offset[0],
+                            world_offset_y: tunnel.region.world_offset[1],
+                            _pad2: 0.0, _pad3: 0.0,
+                        };
+                        state.gpu.queue.write_buffer(&tunnel.region.render_params_buffer, 0, bytemuck::bytes_of(&rp));
+                    }
+                } else {
+                    let rp = state.camera.render_params();
+                    state.gpu.queue.write_buffer(
+                        &state.render_params_buffer,
+                        0,
+                        bytemuck::bytes_of(&rp),
+                    );
+                }
+
                 // Final encoder: LBM output fields + dye advection + render
                 let mut encoder =
                     state
@@ -676,7 +1111,7 @@ impl ApplicationHandler for App {
                             label: Some("frame_encoder"),
                         });
 
-                if !state.paused {
+                if !state.paused && state.zone_manager.is_none() {
                     state.lbm.compute_output(&mut encoder);
                     state.dye_field.step(&mut encoder);
                 }
@@ -711,11 +1146,29 @@ impl ApplicationHandler for App {
                     });
 
                     rpass.set_pipeline(&state.render_pipeline);
-                    rpass.set_bind_group(0, &state.render_bind_group, &[]);
-                    rpass.set_bind_group(1, &state.render_bind_group_1, &[]);
-                    rpass.set_bind_group(2, &state.render_dye_bind_groups[state.dye_field.output_index()], &[]);
-                    rpass.set_bind_group(3, &state.render_bind_group_3, &[]);
-                    rpass.draw(0..3, 0..1);
+                    if let Some(ref zm) = state.zone_manager {
+                        // Multi-draw: one draw call per region
+                        rpass.set_bind_group(1, &state.render_bind_group_1, &[]);
+                        rpass.set_bind_group(3, &state.render_bind_group_3, &[]);
+                        for zone in &zm.zones {
+                            let dye_idx = zone.region.dye.output_index();
+                            rpass.set_bind_group(0, &zone.region.render_bind_group_0, &[]);
+                            rpass.set_bind_group(2, &zone.region.render_dye_bind_groups[dye_idx], &[]);
+                            rpass.draw(0..3, 0..1);
+                        }
+                        for tunnel in &zm.tunnels {
+                            let dye_idx = tunnel.region.dye.output_index();
+                            rpass.set_bind_group(0, &tunnel.region.render_bind_group_0, &[]);
+                            rpass.set_bind_group(2, &tunnel.region.render_dye_bind_groups[dye_idx], &[]);
+                            rpass.draw(0..3, 0..1);
+                        }
+                    } else {
+                        rpass.set_bind_group(0, &state.render_bind_group, &[]);
+                        rpass.set_bind_group(1, &state.render_bind_group_1, &[]);
+                        rpass.set_bind_group(2, &state.render_dye_bind_groups[state.dye_field.output_index()], &[]);
+                        rpass.set_bind_group(3, &state.render_bind_group_3, &[]);
+                        rpass.draw(0..3, 0..1);
+                    }
                 }
 
                 // --- egui pass ---
@@ -744,6 +1197,7 @@ impl ApplicationHandler for App {
                     bullet_count: state.bullets.len(),
                 };
 
+                let cam_rp = state.camera.render_params();
                 let raw_input = state.egui_state.take_egui_input(&state.window);
                 let mut ui_out = None;
                 let full_output = egui_ctx.run(raw_input, |ctx| {
@@ -752,11 +1206,11 @@ impl ApplicationHandler for App {
                         ctx,
                         &goals_clone,
                         |sx, sy| {
-                            let px = sx / SIM_WIDTH as f32 * win_size.width as f32;
-                            let py = sy / SIM_HEIGHT as f32 * win_size.height as f32;
+                            let px = (sx - cam_rp.cam_offset_x) / cam_rp.cam_view_w * win_size.width as f32;
+                            let py = (sy - cam_rp.cam_offset_y) / cam_rp.cam_view_h * win_size.height as f32;
                             (px, py)
                         },
-                        |sr| sr / SIM_WIDTH as f32 * win_size.width as f32,
+                        |sr| sr / cam_rp.cam_view_w * win_size.width as f32,
                     );
                 });
                 let ui_out = ui_out.unwrap();
@@ -828,8 +1282,10 @@ impl ApplicationHandler for App {
                 }
 
                 // Readback fluid data for ball/ship coupling (every 4th frame to save bandwidth)
-                let needs_readback = !state.ball_world.balls.is_empty()
-                    || state.ship.as_ref().map_or(false, |s| s.alive);
+                // Skip when zone_manager is active (it handles its own readback)
+                let needs_readback = state.zone_manager.is_none()
+                    && (!state.ball_world.balls.is_empty()
+                        || state.ship.as_ref().map_or(false, |s| s.alive));
                 if !state.paused && needs_readback && state.frame_count % 4 == 0 {
                     let output_size = (SIM_WIDTH * SIM_HEIGHT * 4) as u64
                         * std::mem::size_of::<f32>() as u64;
@@ -898,8 +1354,13 @@ fn reset_sim(state: &mut AppState) {
     state.ship = None;
     state.bullets.clear();
     state.explosion_waves.clear();
+    state.zone_manager = None;
     state.lbm.reset(&state.gpu.queue);
     state.dye_field.reset(&state.gpu.queue);
+    state.camera.center = [SIM_WIDTH as f32 / 2.0, SIM_HEIGHT as f32 / 2.0];
+    state.camera.zoom = 1.0;
+    state.camera.sim_width = SIM_WIDTH as f32;
+    state.camera.sim_height = SIM_HEIGHT as f32;
     state.current_level = None;
     state.level_goals.clear();
     state.level_description.clear();
@@ -908,6 +1369,49 @@ fn reset_sim(state: &mut AppState) {
 }
 
 fn apply_level(state: &mut AppState, level_idx: usize) {
+    // Check if this is a zone-based level
+    let is_zone = state.levels[level_idx].name == "Zone Coupling Test";
+    if is_zone {
+        let zm = zone::create_zone_test(
+            &state.gpu,
+            &state.render_bgl_0,
+            &state.render_bgl_2,
+        );
+        // Set camera to world extent
+        let (world_w, world_h) = zm.world_bounds();
+        let ship_x = SIM_WIDTH as f32 / 2.0;
+        let ship_y = SIM_HEIGHT as f32 / 2.0;
+        let zone0_offset = zm.zones[0].region.world_offset;
+        state.zone_manager = Some(zm);
+        state.current_level = Some(level_idx);
+        state.level_description = state.levels[level_idx].description.clone();
+        state.level_complete = false;
+        state.level_goals.clear();
+        state.locked_emitter_count = 0;
+        // Spawn ship in zone 0
+        state.ship = Some(Ship::new(ship_x, ship_y, 0.0));
+        state.bullets.clear();
+        state.explosion_waves.clear();
+        state.ball_world.balls.clear();
+        state.emitters.clear();
+        state.gravity_on = false;
+        state.lbm.params.gravity_x = 0.0;
+        state.lbm.params.gravity_y = 0.0;
+        // Camera in world space
+        state.camera.sim_width = world_w;
+        state.camera.sim_height = world_h;
+        state.camera.center = [ship_x + zone0_offset[0], ship_y + zone0_offset[1]];
+        state.camera.zoom = 1.5;
+        state.camera.clamp_to_bounds();
+        state.paused = false;
+        state.sim_speed = DEFAULT_STEPS_PER_FRAME;
+        state.lbm.reset(&state.gpu.queue);
+        state.dye_field.reset(&state.gpu.queue);
+        return;
+    }
+
+    // Normal (single-grid) level
+    state.zone_manager = None;
     let level = &state.levels[level_idx];
     let loaded = load_level(level);
 
@@ -948,9 +1452,19 @@ fn apply_level(state: &mut AppState, level_idx: usize) {
     state.ship = None;
     state.bullets.clear();
     state.explosion_waves.clear();
+    state.camera.sim_width = SIM_WIDTH as f32;
+    state.camera.sim_height = SIM_HEIGHT as f32;
     if let Some(ref spawn) = loaded.ship_spawn {
         state.ship = Some(Ship::new(spawn.x, spawn.y, spawn.angle));
+        // Ship levels: zoom in and center on ship
+        state.camera.center = [spawn.x, spawn.y];
+        state.camera.zoom = 1.5;
+    } else {
+        // Non-ship levels: auto-fit to full grid
+        state.camera.center = [SIM_WIDTH as f32 / 2.0, SIM_HEIGHT as f32 / 2.0];
+        state.camera.zoom = 1.0;
     }
+    state.camera.clamp_to_bounds();
 
     // Reset LBM distributions and dye
     state.lbm.reset(&state.gpu.queue);
@@ -1005,7 +1519,9 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
             state.ball_world.balls.clear();
         }
         KeyCode::KeyR => {
-            reset_sim(state);
+            if state.ship.is_none() {
+                reset_sim(state);
+            }
         }
         KeyCode::Escape => {
             if state.window.fullscreen().is_some() {
@@ -1029,6 +1545,26 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
             // Also toggle pause if no ship is active.
             if state.ship.is_none() {
                 state.paused = !state.paused;
+            }
+        }
+        KeyCode::Tab => {
+            // Cycle active zone (for viewing different zones)
+            if let Some(ref mut zm) = state.zone_manager {
+                let num_zones = zm.zones.len();
+                zm.active = match zm.active {
+                    zone::ActiveRegion::Zone(id) => {
+                        let next = (id + 1) % num_zones;
+                        zone::ActiveRegion::Zone(next)
+                    }
+                    zone::ActiveRegion::Tunnel(_) => zone::ActiveRegion::Zone(0),
+                };
+                // Snap camera to zone's world-space center
+                let ar = zm.active_region();
+                state.camera.center = [
+                    ar.world_offset[0] + ar.width as f32 / 2.0,
+                    ar.world_offset[1] + ar.height as f32 / 2.0,
+                ];
+                state.camera.clamp_to_bounds();
             }
         }
         _ => {}
@@ -1063,10 +1599,12 @@ fn stamp_brush(state: &mut AppState, cx: i32, cy: i32, draw: bool) {
 /// Paint cells with interpolation for continuous strokes.
 fn paint_cells(state: &mut AppState, draw: bool) {
     let win_size = state.window.inner_size();
-    let sx = state.mouse_pos.0 / win_size.width as f64 * SIM_WIDTH as f64;
-    let sy = state.mouse_pos.1 / win_size.height as f64 * SIM_HEIGHT as f64;
-    let cx = sx as i32;
-    let cy = sy as i32;
+    let (sim_x, sim_y) = state.camera.screen_to_sim(
+        state.mouse_pos.0, state.mouse_pos.1,
+        win_size.width as f64, win_size.height as f64,
+    );
+    let cx = sim_x as i32;
+    let cy = sim_y as i32;
 
     if let Some((lx, ly)) = state.last_paint_pos {
         let dx = (cx - lx).abs();
@@ -1250,7 +1788,14 @@ fn upload_ball_data(state: &mut AppState) {
 
 /// Upload ship + bullet render data to GPU buffers.
 fn upload_ship_data(state: &mut AppState) {
-    let ship_data = match &state.ship {
+    // In zone mode, offset ship/bullet positions to world space for rendering
+    let offset = if let Some(ref zm) = state.zone_manager {
+        zm.active_region().world_offset
+    } else {
+        [0.0, 0.0]
+    };
+
+    let mut ship_data = match &state.ship {
         Some(ship) => ship.gpu_data(),
         None => ShipGpuData {
             x: 0.0,
@@ -1263,6 +1808,8 @@ fn upload_ship_data(state: &mut AppState) {
             _pad: 0.0,
         },
     };
+    ship_data.x += offset[0];
+    ship_data.y += offset[1];
     state
         .gpu
         .queue
@@ -1284,7 +1831,12 @@ fn upload_ship_data(state: &mut AppState) {
         .bullets
         .iter()
         .filter(|b| b.alive)
-        .map(|b| b.gpu_data())
+        .map(|b| {
+            let mut gd = b.gpu_data();
+            gd.x += offset[0];
+            gd.y += offset[1];
+            gd
+        })
         .collect();
     if !gpu_bullets.is_empty() {
         state.gpu.queue.write_buffer(
@@ -1365,11 +1917,13 @@ async fn init_state(window: Arc<Window>) -> AppState {
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/render.wgsl").into()),
         });
 
-    let render_params: [u32; 4] = [SIM_WIDTH, SIM_HEIGHT, 0, 0];
+    let mut camera = Camera::new();
+    camera.screen_aspect = size.width as f32 / size.height as f32;
+    let init_render_params = camera.render_params();
     let render_params_buffer = gpu.create_buffer_init(
         "render_params",
-        &render_params,
-        wgpu::BufferUsages::UNIFORM,
+        &[init_render_params],
+        wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     );
 
     let render_bgl =
@@ -1685,6 +2239,11 @@ async fn init_state(window: Arc<Window>) -> AppState {
         render_bind_group,
         render_bind_group_1,
         render_dye_bind_groups,
+        render_params_buffer,
+        render_bgl_0: render_bgl,
+        render_bgl_2,
+        camera,
+        zone_manager: None,
         dye_field,
         frame_count: 0,
         last_fps_time: std::time::Instant::now(),

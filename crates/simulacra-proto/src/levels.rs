@@ -156,6 +156,7 @@ pub fn all_levels() -> Vec<Level> {
         open_arena(),
         current_run(),
         target_practice(),
+        zone_coupling_test(),
     ]
 }
 
@@ -470,7 +471,7 @@ fn open_arena() -> Level {
 
     Level {
         name: "Open Arena".into(),
-        description: "Fly through the arena and shoot!\nW=thrust, A/D=rotate, Space=fire, P=pause\nWatch your exhaust create fluid wakes.".into(),
+        description: "Fly through the arena and shoot!\nWASD=move, Aim=mouse, Space=fire, Scroll=zoom\nWatch your exhaust create fluid wakes.".into(),
         wall_rects,
         wall_circles,
         emitters: vec![],
@@ -478,7 +479,7 @@ fn open_arena() -> Level {
         goals: vec![],
         inlet_rows: vec![],
         gravity_on: false,
-        omega: 1.7,
+        omega: 1.65,
         inlet_velocity: 0.10,
         lock_presets: false,
         ship_spawn: Some(LevelShipSpawn {
@@ -532,7 +533,7 @@ fn current_run() -> Level {
 
     Level {
         name: "Current Run".into(),
-        description: "Strong horizontal flow pushes you right.\nFly upstream! Shoot to create turbulence.\nW=thrust, A/D=rotate, Space=fire".into(),
+        description: "Strong horizontal flow pushes you right.\nFly upstream! Shoot to create turbulence.\nWASD=move, Aim=mouse, Space=fire, Scroll=zoom".into(),
         wall_rects,
         wall_circles,
         emitters: vec![],
@@ -573,7 +574,7 @@ fn target_practice() -> Level {
 
     Level {
         name: "Target Practice".into(),
-        description: "Shoot the blocks! Watch pressure waves\nripple through the fluid on impact.\nW=thrust, A/D=rotate, Space=fire".into(),
+        description: "Shoot the blocks! Watch pressure waves\nripple through the fluid on impact.\nWASD=move, Aim=mouse, Space=fire, Scroll=zoom".into(),
         wall_rects,
         wall_circles: vec![],
         emitters: vec![],
@@ -589,5 +590,24 @@ fn target_practice() -> Level {
             y: h as f32 / 2.0,
             angle: 0.0,
         }),
+    }
+}
+
+/// Level 9: Two zones connected by a tunnel. Tests multi-zone coupling.
+fn zone_coupling_test() -> Level {
+    Level {
+        name: "Zone Coupling Test".into(),
+        description: "Two zones connected by a tunnel.\nFluid flows from zone 0 through the tunnel to zone 1.\nMulti-zone LBM coupling test.".into(),
+        wall_rects: vec![],
+        wall_circles: vec![],
+        emitters: vec![],
+        balls: vec![],
+        goals: vec![],
+        inlet_rows: vec![],
+        gravity_on: false,
+        omega: 1.65,
+        inlet_velocity: 0.08,
+        lock_presets: false,
+        ship_spawn: None,
     }
 }

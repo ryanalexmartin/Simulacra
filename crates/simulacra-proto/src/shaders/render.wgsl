@@ -6,6 +6,14 @@ struct Params {
     height: u32,
     _pad0: u32,
     _pad1: u32,
+    cam_offset_x: f32,
+    cam_offset_y: f32,
+    cam_view_w: f32,
+    cam_view_h: f32,
+    world_offset_x: f32,
+    world_offset_y: f32,
+    _pad2: f32,
+    _pad3: f32,
 };
 
 struct VertexOutput {
@@ -125,16 +133,27 @@ fn edge_fn(v0: vec2<f32>, v1: vec2<f32>, p: vec2<f32>) -> f32 {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let px = u32(in.uv.x * f32(params.width));
-    let py = u32(in.uv.y * f32(params.height));
-    let x = clamp(px, 0u, params.width - 1u);
-    let y = clamp(py, 0u, params.height - 1u);
+    // World-space coordinate from camera
+    let world_x = params.cam_offset_x + in.uv.x * params.cam_view_w;
+    let world_y = params.cam_offset_y + in.uv.y * params.cam_view_h;
 
-    let base = (y * params.width + x) * 4u;
-    let rho = field[base + 0u];
-    let ux = field[base + 1u];
-    let uy = field[base + 2u];
-    let curl = field[base + 3u];
+    // Local cell coordinate for this region
+    let local_x = world_x - params.world_offset_x;
+    let local_y = world_y - params.world_offset_y;
+
+    // Out of bounds for this region: discard (let other draws fill it)
+    if local_x < 0.0 || local_x >= f32(params.width) || local_y < 0.0 || local_y >= f32(params.height) {
+        discard;
+    }
+
+    let x = clamp(u32(local_x), 0u, params.width - 1u);
+    let y = clamp(u32(local_y), 0u, params.height - 1u);
+
+    let field_base = (y * params.width + x) * 4u;
+    let rho = field[field_base + 0u];
+    let ux = field[field_base + 1u];
+    let uy = field[field_base + 2u];
+    let curl = field[field_base + 3u];
 
     // Solid cells: rho == -1.0 sentinel
     var fluid_color: vec3<f32>;
@@ -153,11 +172,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let base_color = mix(raw_color, vec3<f32>(dot(raw_color, vec3<f32>(0.3, 0.6, 0.1))), 0.4);
         fluid_color = mix(base_color, vec3<f32>(0.15, 0.6, 0.25), 0.25);
     } else {
-        // Velocity magnitude — desaturated for dark, subtle base canvas
+        // Velocity magnitude — very subtle dark base, letting dye dominate
         let speed = sqrt(ux * ux + uy * uy);
-        let raw_color = colormap_speed(speed * 5.0);
+        let raw_color = colormap_speed(speed * 1.5);
         let luma = dot(raw_color, vec3<f32>(0.3, 0.6, 0.1));
-        let color = mix(raw_color, vec3<f32>(luma), 0.4);
+        let color = mix(raw_color, vec3<f32>(luma), 0.6);
         // Vorticity: subtle additive tint where curl is strong
         let curl_strength = clamp(abs(curl) * 15.0, 0.0, 1.0);
         let curl_color = colormap_curl(curl * 15.0);
@@ -174,9 +193,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let norm_dye = vec3<f32>(dr, dg, db) / max(dye_strength, 0.001);
     fluid_color = mix(fluid_color, norm_dye, dye_alpha);
 
-    // Ball rendering: overlay smooth circles
-    let sim_x = in.uv.x * f32(ball_params.sim_width);
-    let sim_y = in.uv.y * f32(ball_params.sim_height);
+    // Use world-space coordinates for object rendering (ship, bullets, balls)
+    let sim_x = world_x;
+    let sim_y = world_y;
     var result = fluid_color;
 
     for (var i = 0u; i < ball_params.num_balls; i++) {
