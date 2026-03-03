@@ -27,6 +27,31 @@ struct BallData {
     color_id: f32,
 };
 
+struct ShipData {
+    x: f32,
+    y: f32,
+    angle: f32,
+    alive: f32,
+    half_len: f32,
+    half_width: f32,
+    thrusting: f32,
+    _pad: f32,
+};
+
+struct BulletParams {
+    num_bullets: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+};
+
+struct BulletData {
+    x: f32,
+    y: f32,
+    radius: f32,
+    _pad: f32,
+};
+
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> field: array<f32>;
 
@@ -34,6 +59,10 @@ struct BallData {
 @group(1) @binding(1) var<storage, read> balls: array<BallData>;
 
 @group(2) @binding(0) var<storage, read> dye: array<f32>;
+
+@group(3) @binding(0) var<uniform> ship: ShipData;
+@group(3) @binding(1) var<uniform> bullet_params: BulletParams;
+@group(3) @binding(2) var<storage, read> bullets: array<BulletData>;
 
 // Fullscreen triangle trick: 3 vertices, no vertex buffer needed
 @vertex
@@ -87,6 +116,11 @@ fn ball_color(id: f32) -> vec3<f32> {
         case 5u: { return vec3<f32>(0.95, 0.55, 0.15); } // orange
         default: { return vec3<f32>(0.8, 0.8, 0.8); }
     }
+}
+
+// Edge function for triangle test
+fn edge_fn(v0: vec2<f32>, v1: vec2<f32>, p: vec2<f32>) -> f32 {
+    return (v1.x - v0.x) * (p.y - v0.y) - (v1.y - v0.y) * (p.x - v0.x);
 }
 
 @fragment
@@ -177,6 +211,92 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let final_ball = mix(ball_col, vec3<f32>(0.05, 0.05, 0.08), outline * 0.6);
 
             result = mix(result, final_ball, edge_alpha);
+        }
+    }
+
+    // Ship rendering
+    if ship.alive > 0.5 {
+        let cos_a = cos(ship.angle);
+        let sin_a = sin(ship.angle);
+        let fwd = vec2<f32>(cos_a, sin_a);
+        let left = vec2<f32>(-sin_a, cos_a);
+        let ship_pos = vec2<f32>(ship.x, ship.y);
+
+        // Triangle vertices
+        let nose = ship_pos + fwd * ship.half_len;
+        let rear_left = ship_pos - fwd * ship.half_len + left * ship.half_width;
+        let rear_right = ship_pos - fwd * ship.half_len - left * ship.half_width;
+
+        let p = vec2<f32>(sim_x, sim_y);
+
+        // Edge function test
+        let e0 = edge_fn(nose, rear_left, p);
+        let e1 = edge_fn(rear_left, rear_right, p);
+        let e2 = edge_fn(rear_right, nose, p);
+
+        let inside = (e0 >= 0.0 && e1 >= 0.0 && e2 >= 0.0) || (e0 <= 0.0 && e1 <= 0.0 && e2 <= 0.0);
+
+        if inside {
+            // Local coordinates for shading
+            let local_fwd = dot(p - ship_pos, fwd);
+            let local_side = dot(p - ship_pos, left);
+
+            // Silver-blue metallic base
+            let base_col = vec3<f32>(0.55, 0.62, 0.78);
+
+            // Directional lighting: brighter toward nose, darker at rear
+            let fwd_frac = local_fwd / ship.half_len; // -1 at rear, +1 at nose
+            let light = clamp(fwd_frac * 0.3 + 0.7, 0.4, 1.0);
+
+            // Side shading for 3D feel
+            let side_frac = abs(local_side) / ship.half_width;
+            let side_shade = 1.0 - side_frac * 0.2;
+
+            var ship_color = base_col * light * side_shade;
+
+            // Nose highlight
+            if fwd_frac > 0.7 {
+                let nose_glow = (fwd_frac - 0.7) / 0.3;
+                ship_color = mix(ship_color, vec3<f32>(0.85, 0.9, 1.0), nose_glow * 0.4);
+            }
+
+            // Cockpit stripe
+            if abs(local_side) < 1.5 && fwd_frac > 0.0 {
+                ship_color = mix(ship_color, vec3<f32>(0.2, 0.35, 0.6), 0.3);
+            }
+
+            result = ship_color;
+        }
+
+        // Thruster glow (behind ship when thrusting)
+        if ship.thrusting > 0.5 {
+            let thruster_pos = ship_pos - fwd * (ship.half_len + 2.0);
+            let dist_to_thruster = length(p - thruster_pos);
+            let glow_radius = 8.0;
+            let glow = 1.0 - smoothstep(0.0, glow_radius, dist_to_thruster);
+            if glow > 0.001 {
+                let inner = 1.0 - smoothstep(0.0, glow_radius * 0.3, dist_to_thruster);
+                let glow_color = mix(vec3<f32>(1.0, 0.5, 0.1), vec3<f32>(1.0, 1.0, 0.8), inner);
+                result = mix(result, glow_color, glow * 0.85);
+            }
+        }
+    }
+
+    // Bullet rendering
+    for (var i = 0u; i < bullet_params.num_bullets; i++) {
+        let b = bullets[i];
+        let bx = sim_x - b.x;
+        let by = sim_y - b.y;
+        let bdist = sqrt(bx * bx + by * by);
+
+        if bdist < b.radius + 2.0 {
+            let bullet_alpha = 1.0 - smoothstep(b.radius - 0.3, b.radius + 0.5, bdist);
+            if bullet_alpha > 0.001 {
+                // Bright white-yellow core
+                let core = 1.0 - smoothstep(0.0, b.radius * 0.5, bdist);
+                let bullet_color = mix(vec3<f32>(1.0, 0.9, 0.5), vec3<f32>(1.0, 1.0, 1.0), core * 0.6);
+                result = mix(result, bullet_color, bullet_alpha);
+            }
         }
     }
 

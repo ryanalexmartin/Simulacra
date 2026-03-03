@@ -1,11 +1,17 @@
 mod levels;
+mod ship;
 mod ui;
 
 use levels::{all_levels, load_level, GoalZone, Level};
+use ship::{
+    Bullet, BulletGpuData, BulletRenderParams, ExplosionWave, Ship, ShipGpuData, FIRE_COOLDOWN,
+    MAX_BULLETS,
+};
 use simulacra_engine::dye::{DyeField, DyeInjectPoint};
 use simulacra_engine::gpu::GpuContext;
 use simulacra_engine::lbm::{Lbm2D, CELL_FLUID, CELL_INLET, CELL_OUTLET, CELL_SOLID};
 use simulacra_engine::rigidbody::{BallExplosion, BallGpuData, BallRenderParams, BallWorld, MAX_BALLS};
+use std::collections::HashSet;
 use std::sync::Arc;
 use ui::{UiInputs, draw_goal_zones, draw_ui};
 use winit::application::ApplicationHandler;
@@ -90,6 +96,15 @@ struct AppState {
     ball_world: BallWorld,
     ball_render_buffer: wgpu::Buffer,
     ball_params_buffer: wgpu::Buffer,
+    // Ship + bullets
+    keys_held: HashSet<KeyCode>,
+    ship: Option<Ship>,
+    bullets: Vec<Bullet>,
+    explosion_waves: Vec<ExplosionWave>,
+    ship_data_buffer: wgpu::Buffer,
+    ship_bullet_params_buffer: wgpu::Buffer,
+    ship_bullet_render_buffer: wgpu::Buffer,
+    render_bind_group_3: wgpu::BindGroup,
     // Fluid readback for two-way coupling (1-frame delay)
     fluid_readback_buffer: wgpu::Buffer,
     fluid_data: Vec<f32>,
@@ -285,9 +300,15 @@ impl ApplicationHandler for App {
                 if egui_consumed {
                     return;
                 }
-                if event.state == ElementState::Pressed {
-                    if let PhysicalKey::Code(key) = event.physical_key {
-                        handle_key(state, key);
+                if let PhysicalKey::Code(key) = event.physical_key {
+                    match event.state {
+                        ElementState::Pressed => {
+                            state.keys_held.insert(key);
+                            handle_key(state, key);
+                        }
+                        ElementState::Released => {
+                            state.keys_held.remove(&key);
+                        }
                     }
                 }
             }
@@ -308,6 +329,33 @@ impl ApplicationHandler for App {
                             SIM_HEIGHT,
                             state.sim_speed,
                         );
+                    }
+                    if let Some(ref mut ship) = state.ship {
+                        ship.apply_fluid_forces(
+                            &state.fluid_data,
+                            SIM_WIDTH,
+                            SIM_HEIGHT,
+                            state.sim_speed,
+                        );
+                    }
+
+                    // Ship fire cooldown + bullet firing (once per frame)
+                    if let Some(ref mut ship) = state.ship {
+                        if ship.fire_cooldown > 0 {
+                            ship.fire_cooldown -= 1;
+                        }
+                    }
+                    let ship_fire = state.keys_held.contains(&KeyCode::Space);
+                    if ship_fire {
+                        if let Some(ref mut ship) = state.ship {
+                            if ship.alive
+                                && ship.fire_cooldown == 0
+                                && state.bullets.len() < MAX_BULLETS
+                            {
+                                state.bullets.push(Bullet::spawn(ship));
+                                ship.fire_cooldown = FIRE_COOLDOWN;
+                            }
+                        }
                     }
 
                     // Upload LBM params once per frame
@@ -351,14 +399,66 @@ impl ApplicationHandler for App {
                             SIM_HEIGHT,
                         );
                     }
-                    // Upload cell_props once (emitter velocities don't change between sub-steps)
-                    state
-                        .lbm
-                        .upload_cell_props(&state.gpu.queue, &emitter_cell_props);
 
-                    // Sub-step loop: ball physics + LBM in lockstep
+                    // If no ship, upload cell_props once (old behavior)
+                    let ship_level = state.ship.is_some();
+                    if !ship_level {
+                        state
+                            .lbm
+                            .upload_cell_props(&state.gpu.queue, &emitter_cell_props);
+                    }
+
+                    // Read ship inputs from held keys
+                    let ship_thrust = state.keys_held.contains(&KeyCode::KeyW);
+                    let ship_left = state.keys_held.contains(&KeyCode::KeyA);
+                    let ship_right = state.keys_held.contains(&KeyCode::KeyD);
+
+                    // Collect bullet impact dye points during sub-steps
+                    let mut bullet_impact_dye: Vec<DyeInjectPoint> = Vec::new();
+
+                    // Sub-step loop: ship + bullet + ball physics + LBM in lockstep
                     let sub_dt = 1.0 / state.sim_speed as f32;
                     for _ in 0..state.sim_speed {
+                        // Ship step
+                        if let Some(ref mut ship) = state.ship {
+                            ship.step(
+                                sub_dt,
+                                ship_thrust,
+                                ship_left,
+                                ship_right,
+                                SIM_WIDTH,
+                                SIM_HEIGHT,
+                                &state.base_cell_types,
+                            );
+                        }
+
+                        // Bullet steps
+                        for bullet in &mut state.bullets {
+                            let hit = bullet.step(
+                                sub_dt,
+                                SIM_WIDTH,
+                                SIM_HEIGHT,
+                                &state.base_cell_types,
+                            );
+                            if hit {
+                                state
+                                    .explosion_waves
+                                    .push(ExplosionWave::new(bullet.pos));
+                                bullet_impact_dye.push(DyeInjectPoint {
+                                    x: bullet.pos[0],
+                                    y: bullet.pos[1],
+                                    r: 1.0,
+                                    g: 1.0,
+                                    b: 0.8,
+                                    radius: 6.0,
+                                    strength: 3.0,
+                                    _pad: 0.0,
+                                });
+                            }
+                        }
+                        state.bullets.retain(|b| b.alive);
+
+                        // Ball step
                         let sub_expl = state.ball_world.step(
                             sub_dt,
                             SIM_WIDTH,
@@ -368,8 +468,57 @@ impl ApplicationHandler for App {
                         );
                         explosions.extend(sub_expl);
 
-                        // Rasterize balls on top of emitter base
+                        // Build cell state for this sub-step
                         state.cell_types.copy_from_slice(&emitter_cell_types);
+
+                        // Ship rasterization
+                        if let Some(ref ship) = state.ship {
+                            ship.rasterize(
+                                &mut state.cell_types,
+                                SIM_WIDTH,
+                                SIM_HEIGHT,
+                            );
+                        }
+
+                        // Per-sub-step cell_props when ship/explosions active
+                        if ship_level || !state.explosion_waves.is_empty() {
+                            state.cell_props.copy_from_slice(&emitter_cell_props);
+                            if let Some(ref ship) = state.ship {
+                                ship.rasterize_thruster(
+                                    &mut state.cell_types,
+                                    &mut state.cell_props,
+                                    SIM_WIDTH,
+                                    SIM_HEIGHT,
+                                );
+                            }
+                            for wave in &mut state.explosion_waves {
+                                wave.rasterize(
+                                    &mut state.cell_types,
+                                    &mut state.cell_props,
+                                    SIM_WIDTH,
+                                    SIM_HEIGHT,
+                                );
+                                wave.remaining_steps =
+                                    wave.remaining_steps.saturating_sub(1);
+                            }
+                            state
+                                .explosion_waves
+                                .retain(|w| w.remaining_steps > 0);
+                            state
+                                .lbm
+                                .upload_cell_props(&state.gpu.queue, &state.cell_props);
+                        }
+
+                        // Bullet rasterization
+                        for bullet in &state.bullets {
+                            bullet.rasterize(
+                                &mut state.cell_types,
+                                SIM_WIDTH,
+                                SIM_HEIGHT,
+                            );
+                        }
+
+                        // Ball rasterization
                         state.ball_world.rasterize(
                             &mut state.cell_types,
                             SIM_WIDTH,
@@ -389,10 +538,19 @@ impl ApplicationHandler for App {
                         state.gpu.queue.submit([enc.finish()]);
                     }
 
+                    // Bullet lifetime (once per frame)
+                    for bullet in &mut state.bullets {
+                        bullet.age += 1;
+                        if bullet.age >= ship::BULLET_LIFETIME {
+                            bullet.alive = false;
+                        }
+                    }
+                    state.bullets.retain(|b| b.alive);
+
                     // Keep cell_props in sync for rendering
                     state.cell_props.copy_from_slice(&emitter_cell_props);
 
-                    // Collect dye injection points from emitters and explosions
+                    // Collect dye injection points from emitters, explosions, ship, bullets
                     let mut dye_points: Vec<DyeInjectPoint> = Vec::new();
                     for emitter in &state.emitters {
                         if emitter.is_outlet {
@@ -422,6 +580,25 @@ impl ApplicationHandler for App {
                             _pad: 0.0,
                         });
                     }
+                    // Ship exhaust dye
+                    if let Some(ref ship) = state.ship {
+                        if ship.alive && ship.thrusting {
+                            let tp = ship.thruster_pos();
+                            dye_points.push(DyeInjectPoint {
+                                x: tp[0],
+                                y: tp[1],
+                                r: 1.0,
+                                g: 0.7,
+                                b: 0.2,
+                                radius: 4.0,
+                                strength: 1.0,
+                                _pad: 0.0,
+                            });
+                        }
+                    }
+                    // Bullet impact dye
+                    dye_points.extend(bullet_impact_dye);
+
                     state
                         .dye_field
                         .upload_injections(&state.gpu.queue, &dye_points);
@@ -430,6 +607,12 @@ impl ApplicationHandler for App {
                     // Paused: still rasterize for rendering + preview
                     state.cell_types.copy_from_slice(&state.base_cell_types);
                     state.cell_props.copy_from_slice(&state.base_cell_props);
+                    if let Some(ref ship) = state.ship {
+                        ship.rasterize(&mut state.cell_types, SIM_WIDTH, SIM_HEIGHT);
+                    }
+                    for bullet in &state.bullets {
+                        bullet.rasterize(&mut state.cell_types, SIM_WIDTH, SIM_HEIGHT);
+                    }
                     state.ball_world.rasterize(
                         &mut state.cell_types,
                         SIM_WIDTH,
@@ -498,8 +681,9 @@ impl ApplicationHandler for App {
                     state.dye_field.step(&mut encoder);
                 }
 
-                // Upload ball render data
+                // Upload ball + ship render data
                 upload_ball_data(state);
+                upload_ship_data(state);
 
                 let frame = state
                     .surface
@@ -530,6 +714,7 @@ impl ApplicationHandler for App {
                     rpass.set_bind_group(0, &state.render_bind_group, &[]);
                     rpass.set_bind_group(1, &state.render_bind_group_1, &[]);
                     rpass.set_bind_group(2, &state.render_dye_bind_groups[state.dye_field.output_index()], &[]);
+                    rpass.set_bind_group(3, &state.render_bind_group_3, &[]);
                     rpass.draw(0..3, 0..1);
                 }
 
@@ -555,6 +740,8 @@ impl ApplicationHandler for App {
                     level_description: state.level_description.clone(),
                     level_complete: state.level_complete,
                     goals: goals_clone.clone(),
+                    ship_active: state.ship.as_ref().map_or(false, |s| s.alive),
+                    bullet_count: state.bullets.len(),
                 };
 
                 let raw_input = state.egui_state.take_egui_input(&state.window);
@@ -640,8 +827,10 @@ impl ApplicationHandler for App {
                     state.level_complete = false;
                 }
 
-                // Readback fluid data for ball coupling (every 4th frame to save bandwidth)
-                if !state.paused && !state.ball_world.balls.is_empty() && state.frame_count % 4 == 0 {
+                // Readback fluid data for ball/ship coupling (every 4th frame to save bandwidth)
+                let needs_readback = !state.ball_world.balls.is_empty()
+                    || state.ship.as_ref().map_or(false, |s| s.alive);
+                if !state.paused && needs_readback && state.frame_count % 4 == 0 {
                     let output_size = (SIM_WIDTH * SIM_HEIGHT * 4) as u64
                         * std::mem::size_of::<f32>() as u64;
                     let mut enc = state
@@ -706,6 +895,9 @@ fn reset_sim(state: &mut AppState) {
     state.cell_props = vec![0.0f32; num_cells * 2];
     state.emitters.clear();
     state.ball_world.balls.clear();
+    state.ship = None;
+    state.bullets.clear();
+    state.explosion_waves.clear();
     state.lbm.reset(&state.gpu.queue);
     state.dye_field.reset(&state.gpu.queue);
     state.current_level = None;
@@ -750,6 +942,14 @@ fn apply_level(state: &mut AppState, level_idx: usize) {
     state.ball_world.balls.clear();
     for b in &loaded.balls {
         state.ball_world.spawn(b.x, b.y, b.radius);
+    }
+
+    // Spawn ship if level has ship_spawn
+    state.ship = None;
+    state.bullets.clear();
+    state.explosion_waves.clear();
+    if let Some(ref spawn) = loaded.ship_spawn {
+        state.ship = Some(Ship::new(spawn.x, spawn.y, spawn.angle));
     }
 
     // Reset LBM distributions and dye
@@ -821,8 +1021,15 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
                 state.window.set_fullscreen(Some(Fullscreen::Borderless(None)));
             }
         }
-        KeyCode::Space => {
+        KeyCode::KeyP => {
             state.paused = !state.paused;
+        }
+        KeyCode::Space => {
+            // Space is fire (handled via keys_held in the frame loop).
+            // Also toggle pause if no ship is active.
+            if state.ship.is_none() {
+                state.paused = !state.paused;
+            }
         }
         _ => {}
     }
@@ -1038,6 +1245,53 @@ fn upload_ball_data(state: &mut AppState) {
             .gpu
             .queue
             .write_buffer(&state.ball_render_buffer, 0, bytemuck::cast_slice(&gpu_data));
+    }
+}
+
+/// Upload ship + bullet render data to GPU buffers.
+fn upload_ship_data(state: &mut AppState) {
+    let ship_data = match &state.ship {
+        Some(ship) => ship.gpu_data(),
+        None => ShipGpuData {
+            x: 0.0,
+            y: 0.0,
+            angle: 0.0,
+            alive: 0.0,
+            half_len: 0.0,
+            half_width: 0.0,
+            thrusting: 0.0,
+            _pad: 0.0,
+        },
+    };
+    state
+        .gpu
+        .queue
+        .write_buffer(&state.ship_data_buffer, 0, bytemuck::bytes_of(&ship_data));
+
+    let bullet_params = BulletRenderParams {
+        num_bullets: state.bullets.iter().filter(|b| b.alive).count() as u32,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
+    };
+    state.gpu.queue.write_buffer(
+        &state.ship_bullet_params_buffer,
+        0,
+        bytemuck::bytes_of(&bullet_params),
+    );
+
+    let gpu_bullets: Vec<BulletGpuData> = state
+        .bullets
+        .iter()
+        .filter(|b| b.alive)
+        .map(|b| b.gpu_data())
+        .collect();
+    if !gpu_bullets.is_empty() {
+        state.gpu.queue.write_buffer(
+            &state.ship_bullet_render_buffer,
+            0,
+            bytemuck::cast_slice(&gpu_bullets),
+        );
     }
 }
 
@@ -1263,11 +1517,103 @@ async fn init_state(window: Arc<Window>) -> AppState {
         }),
     ];
 
+    // Ship + bullet GPU buffers (bind group 3)
+    let ship_data_buffer = gpu.create_buffer_init(
+        "ship_data",
+        &[ShipGpuData {
+            x: 0.0,
+            y: 0.0,
+            angle: 0.0,
+            alive: 0.0,
+            half_len: 0.0,
+            half_width: 0.0,
+            thrusting: 0.0,
+            _pad: 0.0,
+        }],
+        wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    );
+
+    let ship_bullet_params_buffer = gpu.create_buffer_init(
+        "bullet_params",
+        &[BulletRenderParams {
+            num_bullets: 0,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        }],
+        wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    );
+
+    let bullet_render_data =
+        vec![BulletGpuData { x: 0.0, y: 0.0, radius: 0.0, _pad: 0.0 }; MAX_BULLETS];
+    let ship_bullet_render_buffer = gpu.create_buffer_init(
+        "bullet_render_data",
+        &bullet_render_data,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    );
+
+    let render_bgl_3 =
+        gpu.device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("render_bgl_3"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+    let render_bind_group_3 = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("render_bg_3"),
+        layout: &render_bgl_3,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: ship_data_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: ship_bullet_params_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: ship_bullet_render_buffer.as_entire_binding(),
+            },
+        ],
+    });
+
     let render_pipeline_layout =
         gpu.device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("render_pl"),
-                bind_group_layouts: &[&render_bgl, &render_bgl_1, &render_bgl_2],
+                bind_group_layouts: &[&render_bgl, &render_bgl_1, &render_bgl_2, &render_bgl_3],
                 push_constant_ranges: &[],
             });
 
@@ -1365,6 +1711,14 @@ async fn init_state(window: Arc<Window>) -> AppState {
         },
         ball_render_buffer,
         ball_params_buffer,
+        keys_held: HashSet::new(),
+        ship: None,
+        bullets: Vec::new(),
+        explosion_waves: Vec::new(),
+        ship_data_buffer,
+        ship_bullet_params_buffer,
+        ship_bullet_render_buffer,
+        render_bind_group_3,
         fluid_readback_buffer,
         fluid_data: vec![0.0f32; num_cells * 4],
         egui_ctx,

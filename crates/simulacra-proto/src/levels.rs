@@ -39,6 +39,13 @@ pub struct LevelInletRow {
     pub is_outlet: bool,
 }
 
+#[derive(Clone)]
+pub struct LevelShipSpawn {
+    pub x: f32,
+    pub y: f32,
+    pub angle: f32,
+}
+
 pub struct Level {
     pub name: String,
     pub description: String,
@@ -52,6 +59,7 @@ pub struct Level {
     pub omega: f32,
     pub inlet_velocity: f32,
     pub lock_presets: bool,
+    pub ship_spawn: Option<LevelShipSpawn>,
 }
 
 pub struct LoadedLevel {
@@ -65,6 +73,7 @@ pub struct LoadedLevel {
     pub inlet_velocity: f32,
     pub locked_emitter_count: usize,
     pub description: String,
+    pub ship_spawn: Option<LevelShipSpawn>,
 }
 
 pub fn load_level(level: &Level) -> LoadedLevel {
@@ -133,6 +142,7 @@ pub fn load_level(level: &Level) -> LoadedLevel {
         inlet_velocity: level.inlet_velocity,
         locked_emitter_count,
         description: level.description.clone(),
+        ship_spawn: level.ship_spawn.clone(),
     }
 }
 
@@ -143,6 +153,9 @@ pub fn all_levels() -> Vec<Level> {
         lid_driven_cavity(),
         ball_fluid_coupling(),
         puzzle_guide_the_ball(),
+        open_arena(),
+        current_run(),
+        target_practice(),
     ]
 }
 
@@ -231,6 +244,7 @@ fn venturi_tube() -> Level {
         omega: 1.85,
         inlet_velocity: 0.08,
         lock_presets: false,
+        ship_spawn: None,
     }
 }
 
@@ -274,6 +288,7 @@ fn von_karman_vortex_street() -> Level {
         omega: 1.7,
         inlet_velocity: 0.20,
         lock_presets: false,
+        ship_spawn: None,
     }
 }
 
@@ -325,6 +340,7 @@ fn lid_driven_cavity() -> Level {
         omega: 1.85,
         inlet_velocity: 0.10,
         lock_presets: false,
+        ship_spawn: None,
     }
 }
 
@@ -370,6 +386,7 @@ fn ball_fluid_coupling() -> Level {
         omega: 1.85,
         inlet_velocity: 0.10,
         lock_presets: false,
+        ship_spawn: None,
     }
 }
 
@@ -423,5 +440,154 @@ fn puzzle_guide_the_ball() -> Level {
         omega: 1.85,
         inlet_velocity: 0.15,
         lock_presets: true,
+        ship_spawn: None,
+    }
+}
+
+// --- Shooter levels ---
+
+/// Level 6: Open arena with scattered obstacles. Fly and shoot freely.
+fn open_arena() -> Level {
+    let w = SIM_WIDTH;
+    let h = SIM_HEIGHT;
+
+    // Edge walls
+    let wall_rects = vec![
+        WallRect { x: 0, y: 0, w, h: 3 },
+        WallRect { x: 0, y: h - 3, w, h: 3 },
+        WallRect { x: 0, y: 0, w: 3, h },
+        WallRect { x: w - 3, y: 0, w: 3, h },
+    ];
+
+    // Scattered circular obstacles
+    let wall_circles = vec![
+        WallCircle { cx: w as f32 * 0.25, cy: h as f32 * 0.35, radius: 18.0 },
+        WallCircle { cx: w as f32 * 0.7, cy: h as f32 * 0.6, radius: 22.0 },
+        WallCircle { cx: w as f32 * 0.5, cy: h as f32 * 0.2, radius: 14.0 },
+        WallCircle { cx: w as f32 * 0.85, cy: h as f32 * 0.25, radius: 16.0 },
+        WallCircle { cx: w as f32 * 0.15, cy: h as f32 * 0.75, radius: 20.0 },
+    ];
+
+    Level {
+        name: "Open Arena".into(),
+        description: "Fly through the arena and shoot!\nW=thrust, A/D=rotate, Space=fire, P=pause\nWatch your exhaust create fluid wakes.".into(),
+        wall_rects,
+        wall_circles,
+        emitters: vec![],
+        balls: vec![],
+        goals: vec![],
+        inlet_rows: vec![],
+        gravity_on: false,
+        omega: 1.7,
+        inlet_velocity: 0.10,
+        lock_presets: false,
+        ship_spawn: Some(LevelShipSpawn {
+            x: w as f32 / 2.0,
+            y: h as f32 / 2.0,
+            angle: 0.0,
+        }),
+    }
+}
+
+/// Level 7: Strong horizontal flow. Ship must navigate in a current.
+fn current_run() -> Level {
+    let w = SIM_WIDTH;
+    let h = SIM_HEIGHT;
+
+    // Channel walls
+    let wall_rects = vec![
+        WallRect { x: 0, y: 0, w, h: 3 },
+        WallRect { x: 0, y: h - 3, w, h: 3 },
+    ];
+
+    // Some obstacles in the flow
+    let wall_circles = vec![
+        WallCircle { cx: w as f32 * 0.4, cy: h as f32 * 0.4, radius: 20.0 },
+        WallCircle { cx: w as f32 * 0.6, cy: h as f32 * 0.65, radius: 18.0 },
+        WallCircle { cx: w as f32 * 0.8, cy: h as f32 * 0.35, radius: 15.0 },
+    ];
+
+    // Strong inlet on left, outlet on right
+    let mut inlet_rows = Vec::new();
+    for y in 3..(h - 3) {
+        inlet_rows.push(LevelInletRow {
+            y,
+            x_start: 0,
+            x_end: 3,
+            vx: 0.12,
+            vy: 0.0,
+            is_outlet: false,
+        });
+    }
+    for y in 3..(h - 3) {
+        inlet_rows.push(LevelInletRow {
+            y,
+            x_start: w - 3,
+            x_end: w,
+            vx: 0.0,
+            vy: 0.0,
+            is_outlet: true,
+        });
+    }
+
+    Level {
+        name: "Current Run".into(),
+        description: "Strong horizontal flow pushes you right.\nFly upstream! Shoot to create turbulence.\nW=thrust, A/D=rotate, Space=fire".into(),
+        wall_rects,
+        wall_circles,
+        emitters: vec![],
+        balls: vec![],
+        goals: vec![],
+        inlet_rows,
+        gravity_on: false,
+        omega: 1.7,
+        inlet_velocity: 0.12,
+        lock_presets: true,
+        ship_spawn: Some(LevelShipSpawn {
+            x: w as f32 * 0.15,
+            y: h as f32 / 2.0,
+            angle: std::f32::consts::PI, // face left (upstream)
+        }),
+    }
+}
+
+/// Level 8: Walled arena with solid blocks to shoot at.
+fn target_practice() -> Level {
+    let w = SIM_WIDTH;
+    let h = SIM_HEIGHT;
+
+    // Edge walls
+    let mut wall_rects = vec![
+        WallRect { x: 0, y: 0, w, h: 3 },
+        WallRect { x: 0, y: h - 3, w, h: 3 },
+        WallRect { x: 0, y: 0, w: 3, h },
+        WallRect { x: w - 3, y: 0, w: 3, h },
+    ];
+
+    // Target blocks scattered around right side
+    wall_rects.push(WallRect { x: w * 3 / 4, y: h / 4, w: 30, h: 8 });
+    wall_rects.push(WallRect { x: w * 3 / 4 - 40, y: h / 2, w: 8, h: 30 });
+    wall_rects.push(WallRect { x: w * 3 / 4 + 20, y: h * 3 / 4 - 15, w: 25, h: 8 });
+    wall_rects.push(WallRect { x: w / 2, y: h / 3, w: 8, h: 8 });
+    wall_rects.push(WallRect { x: w / 2 + 40, y: h * 2 / 3, w: 8, h: 8 });
+
+    Level {
+        name: "Target Practice".into(),
+        description: "Shoot the blocks! Watch pressure waves\nripple through the fluid on impact.\nW=thrust, A/D=rotate, Space=fire".into(),
+        wall_rects,
+        wall_circles: vec![],
+        emitters: vec![],
+        balls: vec![],
+        goals: vec![],
+        inlet_rows: vec![],
+        gravity_on: false,
+        omega: 1.7,
+        inlet_velocity: 0.10,
+        lock_presets: false,
+        ship_spawn: Some(LevelShipSpawn {
+            x: w as f32 * 0.15,
+            y: h as f32 / 2.0,
+            angle: 0.0,
+        }),
     }
 }

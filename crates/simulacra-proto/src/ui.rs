@@ -20,6 +20,8 @@ pub struct UiInputs {
     pub level_description: String,
     pub level_complete: bool,
     pub goals: Vec<GoalZone>,
+    pub ship_active: bool,
+    pub bullet_count: usize,
 }
 
 /// Changes requested by the UI, applied back to AppState after egui_ctx.run().
@@ -104,8 +106,13 @@ pub fn draw_ui(ctx: &egui::Context, inputs: &UiInputs) -> UiOutputs {
             }
 
             // Pause/Play
-            let pause_label = if inputs.paused { "\u{25B6} Play" } else { "\u{23F8} Pause" };
-            if ui.button(pause_label).clicked() {
+            let pause_key = if inputs.ship_active { "[P]" } else { "[P/Space]" };
+            let pause_label = if inputs.paused {
+                format!("\u{25B6} Play {}", pause_key)
+            } else {
+                format!("\u{23F8} Pause {}", pause_key)
+            };
+            if ui.button(&pause_label).clicked() {
                 outputs.pause_toggled = true;
             }
 
@@ -116,6 +123,9 @@ pub fn draw_ui(ctx: &egui::Context, inputs: &UiInputs) -> UiOutputs {
             let nu = (1.0 / inputs.omega as f64 - 0.5) / 3.0;
             let re = inputs.inlet_velocity as f64 * 1024.0 / nu;
             ui.label(format!("Re~{:.0}", re));
+            if inputs.ship_active {
+                ui.label(format!("bullets:{}", inputs.bullet_count));
+            }
             ui.label(format!("balls:{}", inputs.ball_count));
             ui.label(format!("emitters:{}", inputs.emitter_count));
 
