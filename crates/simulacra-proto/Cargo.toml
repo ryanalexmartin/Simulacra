@@ -11,3 +11,6 @@ pollster.workspace = true
 bytemuck.workspace = true
 log.workspace = true
 env_logger.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+egui-winit.workspace = true

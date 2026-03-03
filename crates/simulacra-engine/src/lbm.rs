@@ -315,21 +315,33 @@ impl Lbm2D {
 
     /// Run N simulation steps, then compute output fields.
     pub fn step(&mut self, encoder: &mut wgpu::CommandEncoder, n_steps: u32) {
+        for _ in 0..n_steps {
+            self.step_one(encoder);
+        }
+        self.compute_output(encoder);
+    }
+
+    /// Run a single collide-stream step (no output computation).
+    pub fn step_one(&mut self, encoder: &mut wgpu::CommandEncoder) {
         let wg_x = (self.params.width + 15) / 16;
         let wg_y = (self.params.height + 15) / 16;
 
-        for _ in 0..n_steps {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("lbm_step"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.collide_stream_pipeline);
-            pass.set_bind_group(0, &self.bind_groups[self.current], &[]);
-            pass.dispatch_workgroups(wg_x, wg_y, 1);
-            drop(pass);
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("lbm_step"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.collide_stream_pipeline);
+        pass.set_bind_group(0, &self.bind_groups[self.current], &[]);
+        pass.dispatch_workgroups(wg_x, wg_y, 1);
+        drop(pass);
 
-            self.current = 1 - self.current;
-        }
+        self.current = 1 - self.current;
+    }
+
+    /// Compute output fields (rho, ux, uy, curl) from current distribution.
+    pub fn compute_output(&self, encoder: &mut wgpu::CommandEncoder) {
+        let wg_x = (self.params.width + 15) / 16;
+        let wg_y = (self.params.height + 15) / 16;
 
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("lbm_output"),

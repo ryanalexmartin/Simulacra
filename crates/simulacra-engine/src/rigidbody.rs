@@ -32,6 +32,15 @@ pub struct Ball {
     pub color_id: u32,
 }
 
+/// Event generated when a ball shatters on hard impact.
+pub struct BallExplosion {
+    pub x: f32,
+    pub y: f32,
+    pub radius: f32,
+    pub color_id: u32,
+    pub speed: f32,
+}
+
 /// Manages a collection of rigid balls with simple physics.
 pub struct BallWorld {
     pub balls: Vec<Ball>,
@@ -55,13 +64,13 @@ impl BallWorld {
         }
         let color_id = self.next_color;
         self.next_color += 1;
-        let mass = radius * radius * 0.02; // area-proportional mass
+        let mass = radius * radius * 0.06; // area-proportional mass
         self.balls.push(Ball {
             pos: [x, y],
             vel: [0.0, 0.0],
             radius,
             mass,
-            restitution: 0.6,
+            restitution: 0.75,
             color_id,
         });
         Some(self.balls.len() - 1)
@@ -90,6 +99,7 @@ impl BallWorld {
 
     /// Step the physics simulation.
     /// y=0 is TOP, y increases downward. Gravity adds to vel[1].
+    /// Returns a list of explosions for balls that shattered on hard impact.
     pub fn step(
         &mut self,
         dt: f32,
@@ -97,7 +107,7 @@ impl BallWorld {
         height: u32,
         base_cell_types: &[u32],
         gravity_on: bool,
-    ) {
+    ) -> Vec<BallExplosion> {
         let w = width as f32;
         let h = height as f32;
 
@@ -107,6 +117,9 @@ impl BallWorld {
                 b.vel[1] += self.gravity * dt;
             }
         }
+
+        // Snapshot velocities after gravity, before collisions
+        let vel_before: Vec<[f32; 2]> = self.balls.iter().map(|b| b.vel).collect();
 
         // 2. Ball-ball elastic collisions (O(n^2))
         let n = self.balls.len();
@@ -231,9 +244,39 @@ impl BallWorld {
 
         // 6. Light velocity damping
         for b in &mut self.balls {
-            b.vel[0] *= 0.9995;
-            b.vel[1] *= 0.9995;
+            b.vel[0] *= 0.9999;
+            b.vel[1] *= 0.9999;
         }
+
+        // 7. Detect explosions: balls with large delta_v shatter
+        let mut shattered = vec![false; self.balls.len()];
+        let mut explosions = Vec::new();
+
+        for (i, b) in self.balls.iter().enumerate() {
+            let dvx = b.vel[0] - vel_before[i][0];
+            let dvy = b.vel[1] - vel_before[i][1];
+            let delta_v = (dvx * dvx + dvy * dvy).sqrt();
+            if delta_v > 1.5 {
+                explosions.push(BallExplosion {
+                    x: b.pos[0],
+                    y: b.pos[1],
+                    radius: b.radius,
+                    color_id: b.color_id,
+                    speed: delta_v,
+                });
+                shattered[i] = true;
+            }
+        }
+
+        // Remove shattered balls
+        let mut idx = 0;
+        self.balls.retain(|_| {
+            let keep = !shattered[idx];
+            idx += 1;
+            keep
+        });
+
+        explosions
     }
 
     /// Apply fluid forces to balls (two-way coupling: fluid → ball).
@@ -249,7 +292,7 @@ impl BallWorld {
     ) {
         let w = width as f32;
         let h = height as f32;
-        let drag_coeff = 0.05;
+        let drag_coeff = 0.015;
         let spf = steps_per_frame as f32;
 
         for b in &mut self.balls {

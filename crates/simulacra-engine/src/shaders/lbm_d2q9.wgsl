@@ -1,7 +1,10 @@
-// D2Q9 Lattice Boltzmann - TRT collision + streaming
+// D2Q9 Lattice Boltzmann - TRT collision + Smagorinsky turbulence model
 //
-// TRT (Two Relaxation Time) replaces BGK for dramatically better stability
-// at low viscosity. Uses magic parameter Lambda=1/4 → omega_a = 2 - omega_s.
+// TRT (Two Relaxation Time) with magic parameter Lambda=1/4.
+// Smagorinsky subgrid model: locally increases effective viscosity where
+// strain rates are high, preventing checkerboard instability at low
+// viscosity while preserving detail elsewhere. Enables stable simulation
+// at very high Reynolds numbers.
 //
 // Supports: solid bounce-back, inlet (equilibrium BC), outlet (open BC),
 //           gravity via Guo forcing scheme, velocity clamping.
@@ -89,7 +92,7 @@ fn collide_stream(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    // --- Inlet cells: equilibrium at prescribed velocity ---
+    // --- Inlet cells: equilibrium at prescribed velocity, rho=1.0 ---
     if ct == CELL_INLET {
         let inlet_ux = cell_props[ci * 2u + 0u];
         let inlet_uy = cell_props[ci * 2u + 1u];
@@ -112,6 +115,57 @@ fn collide_stream(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
+    // --- Outlet cells: pressure BC at rho=1.0 with free velocity ---
+    // Holds reference density to absorb/release mass, balancing inlet injection.
+    if ct == CELL_OUTLET {
+        // Compute local velocity from incoming distributions
+        var rho_local = 0.0;
+        var ux_local = 0.0;
+        var uy_local = 0.0;
+        for (var q = 0u; q < 9u; q++) {
+            let fq = f_in[f_idx(q, x, y)];
+            rho_local += fq;
+            ux_local += f32(EX[q]) * fq;
+            uy_local += f32(EY[q]) * fq;
+        }
+
+        // Stability guard: if rho is bad, fall back to zero velocity.
+        // !(a && b) reliably catches NaN since NaN comparisons return false.
+        if !(rho_local > 0.3 && rho_local < 3.0) {
+            ux_local = 0.0;
+            uy_local = 0.0;
+        } else {
+            ux_local /= rho_local;
+            uy_local /= rho_local;
+            // Clamp velocity
+            let spd2 = ux_local * ux_local + uy_local * uy_local;
+            if spd2 > 0.3 * 0.3 {
+                let s = 0.3 / sqrt(spd2);
+                ux_local *= s;
+                uy_local *= s;
+            }
+        }
+
+        // Set equilibrium at reference density, free velocity
+        var f_post: array<f32, 9>;
+        for (var q = 0u; q < 9u; q++) {
+            f_post[q] = feq(q, 1.0, ux_local, uy_local);
+        }
+        // Stream to neighbors
+        for (var q = 0u; q < 9u; q++) {
+            let nx = i32(x) + EX[q];
+            let ny = i32(y) + EY[q];
+            if nx < 0 || nx >= i32(params.width) || ny < 0 || ny >= i32(params.height) {
+                continue; // let distributions leave domain
+            } else if cell_type[cell_idx(u32(nx), u32(ny))] == CELL_SOLID {
+                f_out[f_idx(OPP[q], x, y)] = f_post[q];
+            } else {
+                f_out[f_idx(q, u32(nx), u32(ny))] = f_post[q];
+            }
+        }
+        return;
+    }
+
     // --- Read distributions ---
     var f: array<f32, 9>;
     for (var q = 0u; q < 9u; q++) {
@@ -120,9 +174,22 @@ fn collide_stream(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // --- Macroscopic quantities ---
     var rho = f[0] + f[1] + f[2] + f[3] + f[4] + f[5] + f[6] + f[7] + f[8];
-    rho = max(rho, 0.001); // prevent division by zero
-    var ux = (f[1] + f[5] + f[8] - f[3] - f[6] - f[7]) / rho;
-    var uy = (f[2] + f[5] + f[6] - f[4] - f[7] - f[8]) / rho;
+    var ux = (f[1] + f[5] + f[8] - f[3] - f[6] - f[7]);
+    var uy = (f[2] + f[5] + f[6] - f[4] - f[7] - f[8]);
+
+    // --- Stability guard: reset to equilibrium if density is out of range or NaN ---
+    // !(a && b) reliably catches NaN since NaN comparisons return false on GPU.
+    if !(rho > 0.3 && rho < 3.0) {
+        rho = 1.0;
+        ux = 0.0;
+        uy = 0.0;
+        for (var q = 0u; q < 9u; q++) {
+            f[q] = feq(q, 1.0, 0.0, 0.0);
+        }
+    } else {
+        ux /= rho;
+        uy /= rho;
+    }
 
     // --- Guo velocity correction: u_phys = u_lattice + F/(2*rho) ---
     let gx = params.gravity_x;
@@ -130,27 +197,48 @@ fn collide_stream(@builtin(global_invocation_id) gid: vec3<u32>) {
     ux += gx * 0.5 / rho;
     uy += gy * 0.5 / rho;
 
-    // --- Velocity clamping (LBM requires Ma < ~0.3, cs = 1/sqrt(3)) ---
+    // --- Velocity clamping (stability guard catches blowups, so we can push higher) ---
     let speed_sq = ux * ux + uy * uy;
-    let max_vel = 0.2;
+    let max_vel = 0.3;
     if speed_sq > max_vel * max_vel {
         let s = max_vel / sqrt(speed_sq);
         ux *= s;
         uy *= s;
     }
 
-    // --- TRT collision with Guo forcing ---
-    // omega_s controls viscosity (user-adjustable)
-    // omega_a chosen via magic parameter Lambda = 1/4 for optimal stability:
-    //   (1/omega_s - 0.5)(1/omega_a - 0.5) = 1/4  →  omega_a = 2 - omega_s
-    let omega_s = params.omega;
-    let omega_a = 2.0 - omega_s;
-
-    // Pre-compute equilibrium
+    // --- Pre-compute equilibrium ---
     var eq: array<f32, 9>;
     for (var q = 0u; q < 9u; q++) {
         eq[q] = feq(q, rho, ux, uy);
     }
+
+    // --- Smagorinsky subgrid turbulence model ---
+    // Compute non-equilibrium stress tensor to estimate local strain rate.
+    // Where strain is high (constrictions, wakes), increase effective viscosity
+    // to prevent checkerboard instability while preserving detail elsewhere.
+    var pi_neq_xx = 0.0;
+    var pi_neq_xy = 0.0;
+    var pi_neq_yy = 0.0;
+    for (var q = 0u; q < 9u; q++) {
+        let f_neq = f[q] - eq[q];
+        let ex = f32(EX[q]);
+        let ey = f32(EY[q]);
+        pi_neq_xx += f_neq * ex * ex;
+        pi_neq_xy += f_neq * ex * ey;
+        pi_neq_yy += f_neq * ey * ey;
+    }
+    let pi_mag = sqrt(pi_neq_xx * pi_neq_xx + 2.0 * pi_neq_xy * pi_neq_xy + pi_neq_yy * pi_neq_yy);
+
+    // Smagorinsky constant (0.1 = moderate, higher = more dissipation)
+    let C_s = 0.1;
+    let tau_0 = 1.0 / params.omega;
+    // Effective relaxation time: tau_eff = 0.5 * (tau_0 + sqrt(tau_0^2 + 18 * C_s^2 * |Pi| / rho))
+    let tau_eff = 0.5 * (tau_0 + sqrt(tau_0 * tau_0 + 18.0 * C_s * C_s * pi_mag / rho));
+    let omega_s = 1.0 / tau_eff;
+
+    // --- TRT collision with Smagorinsky-adapted omega ---
+    // omega_a via magic parameter Lambda = 1/4: (1/omega_s - 0.5)(1/omega_a - 0.5) = 1/4
+    let omega_a = 2.0 - omega_s;
 
     var f_post: array<f32, 9>;
     for (var q = 0u; q < 9u; q++) {
@@ -179,18 +267,13 @@ fn collide_stream(@builtin(global_invocation_id) gid: vec3<u32>) {
         f_post[q] += Fi;
     }
 
-    // --- Streaming ---
-    let is_outlet = ct == CELL_OUTLET;
+    // --- Streaming (fluid cells only; solid/inlet/outlet already returned) ---
     for (var q = 0u; q < 9u; q++) {
         let nx = i32(x) + EX[q];
         let ny = i32(y) + EY[q];
 
         if nx < 0 || nx >= i32(params.width) || ny < 0 || ny >= i32(params.height) {
-            if is_outlet {
-                // Outlet at domain boundary: let distributions leave (no bounce-back)
-                continue;
-            }
-            // Regular fluid at domain boundary: bounce-back
+            // Domain boundary: bounce-back
             f_out[f_idx(OPP[q], x, y)] = f_post[q];
         } else if cell_type[cell_idx(u32(nx), u32(ny))] == CELL_SOLID {
             // Bounce back from solid neighbor

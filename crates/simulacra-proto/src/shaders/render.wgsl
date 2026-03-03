@@ -33,6 +33,8 @@ struct BallData {
 @group(1) @binding(0) var<uniform> ball_params: BallParams;
 @group(1) @binding(1) var<storage, read> balls: array<BallData>;
 
+@group(2) @binding(0) var<storage, read> dye: array<f32>;
+
 // Fullscreen triangle trick: 3 vertices, no vertex buffer needed
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
@@ -45,24 +47,24 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
     return out;
 }
 
-// Color map: blue-white-red for signed values (curl/vorticity)
-fn colormap_bwr(t: f32) -> vec3<f32> {
-    // t in [-1, 1], mapped to blue (negative) -> white (zero) -> red (positive)
+// Color map: cyan-black-magenta for signed values (curl/vorticity)
+fn colormap_curl(t: f32) -> vec3<f32> {
+    // t in [-1, 1]: cyan (negative spin) -> dark (zero) -> magenta (positive spin)
     let s = clamp(t, -1.0, 1.0);
     if s < 0.0 {
-        return mix(vec3<f32>(1.0, 1.0, 1.0), vec3<f32>(0.1, 0.2, 0.9), -s);
+        return mix(vec3<f32>(0.0, 0.0, 0.0), vec3<f32>(0.0, 0.8, 0.9), -s);
     } else {
-        return mix(vec3<f32>(1.0, 1.0, 1.0), vec3<f32>(0.9, 0.1, 0.1), s);
+        return mix(vec3<f32>(0.0, 0.0, 0.0), vec3<f32>(0.9, 0.1, 0.7), s);
     }
 }
 
-// Color map: velocity magnitude (dark -> bright, viridis-like)
+// Color map: velocity magnitude (dark -> bright, inferno-like)
 fn colormap_speed(t: f32) -> vec3<f32> {
     let s = clamp(t, 0.0, 1.0);
-    let c0 = vec3<f32>(0.267, 0.004, 0.329);
-    let c1 = vec3<f32>(0.282, 0.140, 0.458);
-    let c2 = vec3<f32>(0.127, 0.566, 0.551);
-    let c3 = vec3<f32>(0.741, 0.873, 0.150);
+    let c0 = vec3<f32>(0.001, 0.000, 0.014); // near-black
+    let c1 = vec3<f32>(0.42, 0.05, 0.52);    // deep purple
+    let c2 = vec3<f32>(0.93, 0.25, 0.23);    // hot red-orange
+    let c3 = vec3<f32>(0.99, 0.91, 0.15);    // bright yellow
 
     if s < 0.333 {
         return mix(c0, c1, s * 3.0);
@@ -103,25 +105,40 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Solid cells: rho == -1.0 sentinel
     var fluid_color: vec3<f32>;
     if rho > -1.5 && rho < -0.5 {
-        fluid_color = vec3<f32>(0.15, 0.15, 0.18);
+        fluid_color = vec3<f32>(0.08, 0.08, 0.10);
     } else if rho > -2.5 && rho < -1.5 {
-        // Inlet cells: rho == -2.0 sentinel (blue tint)
+        // Inlet cells: rho == -2.0 sentinel
         let speed = sqrt(ux * ux + uy * uy);
-        let base_color = colormap_speed(speed * 15.0);
-        fluid_color = mix(base_color, vec3<f32>(0.2, 0.4, 0.9), 0.5);
+        let raw_color = colormap_speed(speed * 5.0);
+        let base_color = mix(raw_color, vec3<f32>(dot(raw_color, vec3<f32>(0.3, 0.6, 0.1))), 0.4);
+        fluid_color = mix(base_color, vec3<f32>(0.15, 0.3, 0.85), 0.35);
     } else if rho > -3.5 && rho < -2.5 {
-        // Outlet cells: rho == -3.0 sentinel (green tint)
+        // Outlet cells: rho == -3.0 sentinel
         let speed = sqrt(ux * ux + uy * uy);
-        let base_color = colormap_speed(speed * 15.0);
-        fluid_color = mix(base_color, vec3<f32>(0.2, 0.8, 0.3), 0.5);
+        let raw_color = colormap_speed(speed * 5.0);
+        let base_color = mix(raw_color, vec3<f32>(dot(raw_color, vec3<f32>(0.3, 0.6, 0.1))), 0.4);
+        fluid_color = mix(base_color, vec3<f32>(0.15, 0.6, 0.25), 0.25);
     } else {
-        // Velocity magnitude visualization
+        // Velocity magnitude — desaturated for dark, subtle base canvas
         let speed = sqrt(ux * ux + uy * uy);
-        let color = colormap_speed(speed * 15.0);
-        // Mix in vorticity as a subtle overlay
-        let curl_color = colormap_bwr(curl * 50.0);
-        fluid_color = mix(color, curl_color, 0.4);
+        let raw_color = colormap_speed(speed * 5.0);
+        let luma = dot(raw_color, vec3<f32>(0.3, 0.6, 0.1));
+        let color = mix(raw_color, vec3<f32>(luma), 0.4);
+        // Vorticity: subtle additive tint where curl is strong
+        let curl_strength = clamp(abs(curl) * 15.0, 0.0, 1.0);
+        let curl_color = colormap_curl(curl * 15.0);
+        fluid_color = color + curl_color * curl_strength * 0.10;
     }
+
+    // Dye overlay: blend colored dye on top of base fluid
+    let dye_base = (y * params.width + x) * 4u;
+    let dr = dye[dye_base];
+    let dg = dye[dye_base + 1u];
+    let db = dye[dye_base + 2u];
+    let dye_strength = max(dr, max(dg, db));
+    let dye_alpha = clamp(dye_strength * 3.0, 0.0, 0.9);
+    let norm_dye = vec3<f32>(dr, dg, db) / max(dye_strength, 0.001);
+    fluid_color = mix(fluid_color, norm_dye, dye_alpha);
 
     // Ball rendering: overlay smooth circles
     let sim_x = in.uv.x * f32(ball_params.sim_width);
